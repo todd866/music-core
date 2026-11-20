@@ -1,0 +1,18 @@
+{
+  "name": "music-core-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The one queue engine: moods, station mixes, kind queues over the shared map. Consumed by 6ian (music-radio) and the Mac CLI. music-radio carries a vendored copy at vendor/engine; tools/sync-engine.sh + tests keep them identical.",
+  "exports": {
+    ".": "./engine.ts",
+    "./engine": "./engine.ts",
+    "./space": "./space.ts",
+    "./moods": "./moods.ts",
+    "./rules": "./rules.ts",
+    "./genres": "./genres.ts",
+    "./stations": "./stations.ts",
+    "./source": "./source.ts",
+    "./profile": "./profile.ts"
+  }
+}

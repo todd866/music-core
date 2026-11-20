@@ -29,7 +29,7 @@ say "step 1: push exit $push_rc"
 
 # 2. Incremental Gemini Batch embeddings (uses R2 catalogue + local venv + Gemini key)
 say "step 2: embed"
-"${ssh_local[@]}" "/bin/zsh '$root/embed/nightly.sh'" >> "$log" 2>&1
+"${ssh_local[@]}" "MUSIC_EMBED_CAP_USD='${MUSIC_EMBED_CAP_USD:-}' /bin/zsh '$root/embed/nightly.sh'" >> "$log" 2>&1
 embed_rc=$?
 say "step 2: embed exit $embed_rc"
 (( embed_rc == 0 )) || notes+=("embed exit $embed_rc")

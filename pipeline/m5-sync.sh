@@ -88,8 +88,10 @@ if (( got_vec )); then
   fi
 fi
 
-# 3. Sync Glancebar lossless hot set (respects METERED_LINK; lock exit 75 is normal if Glancebar is syncing)
+# 3. Sync Glancebar lossless hot set + pull shared ids/facts/taste snapshot for offline engine
 if [ ! -e "$HOME/.local/state/METERED_LINK" ]; then
+  /opt/homebrew/bin/python3 "$root/store/musicstore.py" pull >> "$log" 2>&1 || say "store pull: warn"
+  /opt/homebrew/bin/python3 "$root/store/musicstore.py" taste-pull >> "$log" 2>&1 || say "taste-pull: warn"
   /opt/homebrew/bin/python3 "$root/library/musiclib.py" sync >> "$log" 2>&1
   rc=$?
   if (( rc == 0 )); then

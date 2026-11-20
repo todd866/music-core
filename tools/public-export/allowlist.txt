@@ -37,3 +37,5 @@ pipeline/check.py
 tools/public-export/allowlist.txt
 tools/public-export/export.py
 tools/public-export/publish.sh
+
+engine/**

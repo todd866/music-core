@@ -161,5 +161,54 @@ class TasteTest(unittest.TestCase):
         self.assertEqual(kinds, ['like', 'more'])
 
 
+class SnapshotTest(unittest.TestCase):
+    def test_fold_taste_log_into_engine_snapshot(self):
+        evs = [
+            ms.make_event('ian', '6ian', 'play', sha=A, at='2026-11-17T01:00:00Z', host='m5'),
+            ms.make_event('ian', 'glancebar', 'like', sha=A, at='2026-11-17T02:00:00Z', host='m5'),
+            ms.make_event('ian', 'tv', 'play', sha=B, at='2026-11-18T01:00:00Z', host='m2'),
+            ms.make_event('ian', '6ian', 'unlike', sha=A, at='2026-11-18T02:00:00Z', host='m5'),
+            ms.make_event('ian', 'glancebar', 'skip', sha=B, at='2026-11-18T03:00:00Z', host='m5'),
+            ms.make_event('ian', 'glancebar', 'skip', sha=B, at='2026-11-19T03:00:00Z', host='m5'),
+            ms.make_event('ian', 'tv', 'dislike', sha=C, at='2026-11-19T04:00:00Z', host='m2'),
+            ms.make_event('ian', 'tv', 'undislike', sha=C, at='2026-11-19T05:00:00Z', host='m2'),
+            ms.make_event('ian', '6ian', 'finish', sha=A, at='2026-11-19T06:00:00Z', host='m5', fraction=0.9),
+        ]
+        # an alias-only event cannot key a song: ignored
+        evs.append(ms.make_event('ian', '6ian', 'like', alias='key:zed|other', at='2026-11-19T07:00:00Z', host='m5'))
+        snap = ms.build_snapshot('ian', evs, now='2026-11-20T00:00:00Z')
+        self.assertEqual(snap, {
+            'listener': 'ian', 'tz': 'Australia/Perth', 'style': 'home', 'newShare': None,
+            'likes': [], 'dislikes': [], 'skips': {B: 2},
+            'heard': {A: 1795068000000, B: 1794963600000},
+            'generatedAt': '2026-11-20T00:00:00Z',
+        })
+
+    def test_epoch_milliseconds(self):
+        # heard must be epoch-ms (engine does Date.parse-style comparisons)
+        evs = [ms.make_event('ian', '6ian', 'play', sha=A, at='2026-11-17T01:00:00Z', host='m5')]
+        snap = ms.build_snapshot('ian', evs, now='2026-11-20T00:00:00Z')
+        self.assertIsInstance(snap['heard'][A], int)
+        self.assertGreater(snap['heard'][A], 1_700_000_000_000)
+
+    def test_cli_snapshot_writes_read_side_and_uploads(self):
+        import argparse
+        state = Path(tempfile.mkdtemp())
+        for ev in (ms.make_event('ian', '6ian', 'like', sha=A, at='2026-11-17T01:00:00Z', host='m5'),):
+            ms.append(ev, state)
+        (state / 'taste-all').symlink_to(state / 'taste')  # read side mirrors the spool for the test
+        sent = []
+
+        def runner(argv, timeout=600):
+            sent.append(argv)
+            return Proc(0, '')
+        ms.write_snapshot('ian', state=state, cfg={'remote': 'r:bucket'}, runner=runner, now='2026-11-20T00:00:00Z')
+        path = state / 'taste-all/ian/snapshot.json'
+        snap = json.loads(path.read_text())
+        self.assertEqual(snap['likes'], [A])
+        self.assertEqual(sent[0][0], 'copyto')
+        self.assertTrue(sent[0][2].startswith('r:bucket/music/taste/ian/snapshot.json'))
+
+
 if __name__ == '__main__':
     unittest.main()

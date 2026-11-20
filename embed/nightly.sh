@@ -52,6 +52,11 @@ else
     GEMINI_API_KEY=$(sed -n 's/^GEMINI_API_KEY=//p' "$keyfile" | head -1 | tr -d '"'"'"' \r')
     export GEMINI_API_KEY
   fi
+  # Honour dated per-day cap override (~/.config/glancebar/embed-cap-override.json, Perth date, same as fetch_worker.py)
+  if [ -z "${MUSIC_EMBED_CAP_USD:-}" ] && [ -r "$HOME/.config/glancebar/embed-cap-override.json" ]; then
+    ov=$("$py" -c 'import json,time,os; o=json.load(open(os.path.expanduser("~/.config/glancebar/embed-cap-override.json"))); print(o["usd"] if o.get("perth_date")==time.strftime("%Y-%m-%d",time.gmtime(time.time()+8*3600)) else "")' 2>/dev/null || true)
+    [ -n "$ov" ] && export MUSIC_EMBED_CAP_USD="$ov" && say "cap override active: \$$ov"
+  fi
   if [ -z "${GEMINI_API_KEY:-}" ]; then
     say "FAIL no GEMINI_API_KEY in $keyfile"
     failed+=("no key")

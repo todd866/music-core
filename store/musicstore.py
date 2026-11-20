@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path.home()
@@ -410,6 +411,81 @@ RADIO_KINDS = {'play': 'play', 'finish': 'finish', 'skip': 'skip', 'like': 'like
                'dislike': 'dislike', 'undislike': 'undislike', 'more': 'more', 'less': 'less'}
 
 
+# --- the taste snapshot (the engine's input) -------------------------------------------------------
+
+def _epoch_ms(at):
+    try:
+        dt = datetime.fromisoformat(str(at).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def build_snapshot(listener, events, *, tz='Australia/Perth', style='home', newShare=None, now=None):
+    """Fold a listener's taste events (oldest first, any app/host) into the engine's snapshot:
+    exactly the Profile fields buildQueue reads. like/unlike and dislike/undislike toggle;
+    skip and early-skip each count once; the latest play/finish per sha sets heard (epoch ms).
+    Alias-only events cannot key a song and are ignored."""
+    likes, dislikes, skips, heard = [], [], {}, {}
+    for ev in sorted(events, key=lambda e: e.get('at') or ''):
+        sha, kind = ev.get('sha'), ev.get('kind')
+        if not sha or ev.get('listener') != listener:
+            continue
+        ts = _epoch_ms(ev.get('at'))
+        if kind in ('play', 'finish'):
+            if sha in heard:
+                heard[sha] = max(heard[sha], ts or 0)
+            else:
+                heard[sha] = ts or 0
+        elif kind == 'like':
+            if sha not in likes:
+                likes.append(sha)
+        elif kind == 'unlike':
+            likes = [s for s in likes if s != sha]
+        elif kind == 'dislike':
+            if sha not in dislikes:
+                dislikes.append(sha)
+        elif kind == 'undislike':
+            dislikes = [s for s in dislikes if s != sha]
+        elif kind in ('skip', 'early-skip'):
+            skips[sha] = skips.get(sha, 0) + 1
+    return {'listener': listener, 'tz': tz, 'style': style, 'newShare': newShare,
+            'likes': likes, 'dislikes': dislikes, 'skips': skips, 'heard': heard,
+            'generatedAt': now or now_iso()}
+
+
+def write_snapshot(listener, state=None, cfg=None, runner=None, **kw):
+    """Build the snapshot from the read side (state/taste-all, falling back to this host's spool),
+    write state/taste-all/<listener>/snapshot.json and copy it to the bucket. One JSON object at
+    music/taste/<listener>/snapshot.json, beside (never inside) the event shards."""
+    state = Path(state or STATE)
+    cfg = cfg or config()
+    root = state / 'taste-all' if (state / 'taste-all').exists() else state / 'taste'
+    # A sync rebuild must not reset settings the listener chose (/api/me): tz and newShare
+    # carry over from the existing snapshot unless explicitly overridden.
+    kw = dict(kw)
+    prev_path = state / 'taste-all' / listener / 'snapshot.json'
+    if prev_path.exists():
+        try:
+            prev = json.loads(prev_path.read_text())
+        except Exception:
+            prev = {}
+        if prev.get('tz'):
+            kw.setdefault('tz', prev['tz'])
+        if prev.get('newShare') is not None:
+            kw.setdefault('newShare', prev['newShare'])
+    snap = build_snapshot(listener, read_events(root, listener), **kw)
+    path = state / 'taste-all' / listener / 'snapshot.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, snap)
+    remote = f"{cfg['remote']}/{TASTE_PREFIX}/{listener}/snapshot.json"
+    ok = (runner or rclone)(['copyto', str(path), remote]).returncode == 0
+    return {'snapshot': snap, 'uploaded': ok}
+
+
+
 def radio_events(profile, listener, host=None):
     """The radio's own events from a profile (radio/profiles/<account>.json) as taste events.
     Events that came in from another app (via a device token, e.g. Glancebar) are left out: that
@@ -495,6 +571,12 @@ def main(argv=None):
     tc = sub.add_parser('taste-counts')
     tc.add_argument('--spool', action='store_true', help="count this host's spool, not the pulled copy")
     sub.add_parser('import-radio')
+    sn = sub.add_parser('snapshot', help='fold the taste log into music/taste/<listener>/snapshot.json')
+    sn.add_argument('--listener', required=True)
+    sn.add_argument('--tz', default='Australia/Perth')
+    sn.add_argument('--style', default='home', choices=('home', 'discovery'))
+    sn.add_argument('--new-share', type=float)
+    sn.add_argument('--no-upload', action='store_true')
     sub.add_parser('sync')
     r = sub.add_parser('resolve')
     for name in ('apple', 'persistent', 'youtube', 'isrc', 'path', 'artist', 'title'):
@@ -546,6 +628,19 @@ def main(argv=None):
     if args.cmd == 'import-radio':
         print(json.dumps(import_radio(cfg=cfg)))
         return 0
+    if args.cmd == 'snapshot':
+        if args.no_upload:
+            class _Noop:
+                returncode = 0
+            out = write_snapshot(args.listener, cfg=cfg, runner=lambda argv, timeout=600: _Noop(),
+                                 tz=args.tz, style=args.style, newShare=args.new_share)
+            out['uploaded'] = None
+        else:
+            out = write_snapshot(args.listener, cfg=cfg,
+                                 tz=args.tz, style=args.style, newShare=args.new_share)
+        out.pop('snapshot', None)
+        print(json.dumps(out))
+        return 0 if out['uploaded'] is not False else 1
     if args.cmd == 'sync':
         out = {'at': now_iso()}
         if METERED.exists():
@@ -555,6 +650,9 @@ def main(argv=None):
                 out['radio'] = import_radio(cfg=cfg)
             out['flush'] = flush(cfg=cfg)
             out['pull'] = pull(cfg=cfg)
+            out['taste-pull'] = taste_pull(cfg=cfg)
+            out['snapshot'] = {listener: write_snapshot(listener, cfg=cfg)['uploaded']
+                               for listener in cfg.get('listeners') or []}
         write_json(STATE / 'sync-status.json', out)
         print(json.dumps(out))
         return 0 if not (out.get('flush') or {}).get('failed') else 1
