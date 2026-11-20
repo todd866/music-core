@@ -1,0 +1,1420 @@
+#!/usr/bin/env python3
+"""Glancebar lossless hot-set sync via rclone. Stdlib only; credentials live in rclone config."""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import struct
+import subprocess
+import stat
+import sys
+import tempfile
+import time
+import unicodedata
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+_bundle = _HERE / 'offline_cache.py'
+_dev = _HERE.parent / 'offline-cache'
+if _bundle.is_file():
+    if str(_HERE) not in sys.path:
+        sys.path.insert(0, str(_HERE))
+elif _dev.is_dir() and str(_dev) not in sys.path:
+    sys.path.insert(0, str(_dev))
+import offline_cache as oc  # noqa: E402
+import trackmeta  # noqa: E402
+
+HOME = Path.home()
+DEFAULT_CONFIG = HOME / '.config/glancebar/music-library.json'
+DEFAULT_STATE = HOME / '.local/state/music-library'
+DEFAULT_REQUESTS = HOME / 'Library/Application Support/Glancebar/mix/offline-requests.json'
+# The 6IAN web radio's recent likes (tools/radio-sync writes it): kept in the hot set beside the app's requests.
+RADIO_REQUESTS = HOME / '.local/state/glancebar-radio/hot-requests.json'
+METERED_FLAG = HOME / '.local/state/METERED_LINK'
+TRASH = Path('/usr/bin/trash')
+AUDIO_SUFFIXES = {'.m4a', '.mp4', '.alac'}
+
+CATALOGUE_SCHEMA = 1
+PLAN_SCHEMA = 1
+STATUS_SCHEMA = 1
+GIB = 1024 ** 3
+
+
+def normal(value):
+    return oc.normal(value)
+
+
+def match_key(artist, title):
+    return (normal(artist), normal(title))
+
+
+def config_path(override=None):
+    return Path(override).expanduser() if override else DEFAULT_CONFIG
+
+
+def load_config(path=None):
+    p = config_path(path)
+    try:
+        raw = json.loads(p.read_text())
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f'music-library config unreadable: {p}: {exc}') from exc
+    for key in ('remote', 'hot_dir', 'cap_gb', 'keep_days'):
+        if key not in raw:
+            raise ValueError(f'music-library config missing {key!r}')
+    return {
+        'remote': str(raw['remote']).rstrip('/'),
+        'hot_dir': Path(raw['hot_dir']).expanduser(),
+        'cap_gb': float(raw['cap_gb']),
+        'keep_days': int(raw['keep_days']),
+        'min_free_gb': float(raw.get('min_free_gb', 20)),
+        'max_playlist_tracks': int(raw.get('max_playlist_tracks', 120)),
+        # The Mac that holds masters lists every root here (drives are pools); the catalogue
+        # builder reads them for hashes and tags and builds from the bucket's listing.
+        'masters_roots': [Path(r).expanduser() for r in raw.get('masters_roots') or []],
+        'catalogue_prefixes': tuple(raw.get('catalogue_prefixes') or DEFAULT_PREFIXES),
+        # Alias claims (Apple ids, persistent ids, YouTube ids) other Macs hand the builder.
+        'alias_inputs': [str(Path(a).expanduser()) for a in
+                         raw.get('alias_inputs') or [str(DEFAULT_STATE / 'alias-inputs' / '*.jsonl')]],
+        'catalogue_fetch_max': int(raw.get('catalogue_fetch_max', 200)),
+        'config_path': p,
+    }
+
+
+def max_playlist_tracks(cfg):
+    return int(cfg.get('max_playlist_tracks', 120))
+
+
+def cap_bytes_from_config(cfg):
+    return int(cfg['cap_gb'] * GIB)
+
+
+def min_free_bytes_from_config(cfg):
+    return int(cfg.get('min_free_gb', 20) * GIB)
+
+
+def physical_free_bytes(path):
+    p = Path(path).expanduser()
+    while not p.exists():
+        p = p.parent
+    s = os.statvfs(p)
+    return min(s.f_bavail, s.f_bfree) * s.f_frsize
+
+
+def state_dir(override=None):
+    return Path(override).expanduser() if override else DEFAULT_STATE
+
+
+def sha256_file(path, chunk=1024 * 1024):
+    h = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(chunk), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def mp4_duration_seconds(path):
+    """Track duration in seconds, or None. (Until 12 Nov 2026 this read the wrong bytes of the
+    media header and every catalogue entry said 0.0.)"""
+    return trackmeta.read_track_metadata(path).get('durationSeconds')
+
+
+def rclone_bin():
+    return shutil.which('rclone')
+
+
+def rclone_run(argv, check=True):
+    exe = rclone_bin()
+    if not exe:
+        raise RuntimeError('rclone not installed')
+    proc = subprocess.run([exe, *argv], capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or '').strip() or f'rclone exit {proc.returncode}'
+        raise RuntimeError(msg)
+    return proc
+
+
+def remote_catalogue_path(remote):
+    return f'{remote}/catalogue.json'
+
+
+def fetch_remote_json(remote, name, dest):
+    """Download remote `name` to local path dest via rclone copyto."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + '.part')
+    try:
+        rclone_run(['copyto', f'{remote}/{name}', str(part)])
+        part.replace(dest)
+    except RuntimeError:
+        part.unlink(missing_ok=True)
+        raise
+
+
+def upload_local_json(local_path, remote, name):
+    rclone_run(['copyto', str(local_path), f'{remote}/{name}'])
+
+
+def remote_list_files(remote):
+    """Return set of relative paths under remote (excluding catalogue.json at root)."""
+    proc = rclone_run(['lsf', remote, '--files-only', '-R'], check=True)
+    rows = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    return rows
+
+
+def remote_fetch_file(remote, relpath, dest_part):
+    rclone_run(['copyto', f'{remote}/{relpath}', str(dest_part)])
+
+
+def remote_object_meta(remote, relpath):
+    """Return rclone lsjson metadata for one remote object, or None when absent."""
+    proc = rclone_run(['lsjson', f'{remote}/{relpath}', '--hash'], check=False)
+    if proc.returncode != 0:
+        return None
+    try:
+        rows = json.loads(proc.stdout or '[]')
+    except json.JSONDecodeError:
+        return None
+    if not rows or not isinstance(rows[0], dict):
+        return None
+    row = rows[0]
+    hashes = row.get('Hashes') or {}
+    sha = hashes.get('sha256') or hashes.get('SHA256') or row.get('sha256')
+    return {'sizeBytes': int(row.get('Size') or row.get('size') or 0), 'sha256': sha}
+
+
+_ASK_REMOTE = object()
+
+
+def remote_confirms_catalogue(remote, relpath, entry, meta=_ASK_REMOTE):
+    """True when the remote object matches catalogue size and hash when reported.
+
+    `meta` is what a lookup already answered; None means the object is not there. Only when
+    no answer is passed is the remote asked. (None used to mean "ask", so a caller's own
+    lookup that found nothing fell through to the real rclone: a unit test reached the
+    network, and failed on a Mac with no rclone.)
+    """
+    if meta is _ASK_REMOTE:
+        meta = remote_object_meta(remote, relpath)
+    if not meta:
+        return False, 'remote object missing'
+    expected_size = int(entry.get('sizeBytes') or 0)
+    if meta.get('sizeBytes') != expected_size:
+        return False, 'remote size mismatch'
+    remote_hash = meta.get('sha256')
+    catalogue_hash = entry.get('sha256')
+    if remote_hash and catalogue_hash and str(remote_hash).lower() != str(catalogue_hash).lower():
+        return False, 'remote hash mismatch'
+    return True, None
+
+
+def load_build_cache(state):
+    p = state / 'catalogue-build-cache.json'
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def save_build_cache(state, cache):
+    p = state / 'catalogue-build-cache.json'
+    p.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(p, cache)
+
+
+def catalogue_entry_for_file(path, masters_root, cache):
+    rel = str(path.relative_to(masters_root))
+    st = path.stat()
+    stamp = [st.st_size, str(st.st_mtime_ns)]
+    prev = cache.get(rel, {})
+    unchanged = prev.get('stamp') == stamp and prev.get('entry')
+    if unchanged and 'meta' in prev['entry']:
+        return prev['entry'], cache
+    tags = {}
+    duration = None
+    meta = {}
+    if path.suffix.lower() in ('.m4a', '.mp4'):
+        try:
+            tags = oc.mp4_tags(path)
+        except (OSError, ValueError, UnicodeError):
+            tags = {}
+        full = trackmeta.read_track_metadata(path)
+        duration = full.get('durationSeconds')
+        meta = trackmeta.catalogue_metadata(full)
+    entry = {
+        'relativePath': rel,
+        'sizeBytes': st.st_size,
+        'mtimeNs': str(st.st_mtime_ns),
+        # An unchanged file read before metadata was recorded keeps its hash: only the header
+        # is read again, not the whole file.
+        'sha256': prev['entry']['sha256'] if unchanged and prev['entry'].get('sha256') else sha256_file(path),
+        'tags': {k: tags.get(k, '') or meta.get(k, '') for k in ('title', 'artist', 'album')},
+        # Everything the file says about itself (owner rule, 12 Nov 2026): identifiers, credits,
+        # dates, numbering, and the embedded cover's size and hash.
+        'meta': meta,
+    }
+    if duration:
+        entry['durationSeconds'] = duration
+    cache[rel] = {'stamp': stamp, 'entry': entry}
+    return entry, cache
+
+
+def _roots(masters_dir):
+    """One masters folder or several (drives are capacity pools: owner, 18 Nov 2026). Each root holds
+    the same AM-Lossless/... layout, so a file's path under its root is its R2 key either way."""
+    items = masters_dir if isinstance(masters_dir, (list, tuple)) else [masters_dir]
+    return [Path(m).expanduser().resolve() for m in items]
+
+
+def build_catalogue(masters_dir, state):
+    roots = _roots(masters_dir)
+    for masters in roots:
+        if not masters.is_dir():
+            raise ValueError(f'masters directory missing: {masters}')
+    cache = load_build_cache(state)
+    entries = []
+    skipped = []
+    seen = set()
+    for masters in roots:
+        cache = _catalogue_root(masters, cache, entries, skipped, seen)
+    if skipped:
+        print(f'catalogue: skipped {len(skipped)} file(s), first: {skipped[0]}', file=sys.stderr)
+    if not entries:
+        raise ValueError(f'no audio masters found under {", ".join(map(str, roots))}')
+    save_build_cache(state, cache)
+    return {
+        'schemaVersion': CATALOGUE_SCHEMA,
+        'generatedAt': int(time.time()),
+        'entries': entries,
+    }
+
+
+def _catalogue_root(masters, cache, entries, skipped, seen):
+    def walk_error(exc):
+        skipped.append(f'{getattr(exc, "filename", "?")}: {exc.strerror or exc}')
+
+    found = []
+    # os.walk with onerror: one unreadable or vanished directory must not abort the catalogue.
+    for folder, _dirs, names in os.walk(masters, onerror=walk_error):
+        found.extend(Path(folder) / name for name in names)
+    for path in sorted(found):
+        if path.suffix.lower() not in AUDIO_SUFFIXES:
+            continue
+        # Masters usually live on an external drive, so the laptop's "playable local file"
+        # rule (offline_cache.local_file refuses /Volumes) does not apply here. A master is
+        # any regular, non-empty, non-symlink audio file. Anything else is reported.
+        try:
+            st = path.lstat()
+        except OSError as exc:
+            skipped.append(f'{path}: {exc}')
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
+            skipped.append(f'{path}: not a regular non-empty file')
+            continue
+        entry, cache = catalogue_entry_for_file(path, masters, cache)
+        if entry['relativePath'] in seen:  # same key in two pools: the first root wins
+            skipped.append(f'{path}: duplicate of {entry["relativePath"]} in an earlier root')
+            continue
+        seen.add(entry['relativePath'])
+        entries.append(entry)
+    return cache
+
+
+# --- The catalogue from the bucket (19 Nov 2026) --------------------------------------------------
+# The catalogue is the list of masters in R2, whichever drive or Mac put them there. Until this date
+# it was a walk of the drives, so a master placed straight into R2 (the 6IAN lane: 582 songs on
+# 19 Nov) never reached the catalogue or the nightly embed, and one unreadable drive failed the
+# whole build. Now the R2 listing is the truth; a readable masters root supplies hash and tags for
+# a new object, the previous catalogue supplies them for an unchanged one, and anything else is
+# fetched from R2 (bounded per run).
+
+DEFAULT_PREFIXES = ('AM-Lossless/', 'AM-MV/')
+SHRINK_GUARD = 0.9   # a build that would drop more than a tenth of the catalogue is refused
+
+
+def remote_listing(remote, prefixes=DEFAULT_PREFIXES, runner=None):
+    """{relativePath: {'size': int, 'time': str}} for audio objects under the prefixes.
+
+    One --fast-list request per prefix (no HEAD per object; --use-server-modtime). A failed
+    listing raises: a partial listing must never become a smaller catalogue."""
+    out = {}
+    for prefix in prefixes:
+        prefix = prefix.strip('/') + '/'
+        argv = ['lsf', '-R', '--files-only', '--fast-list', '--use-server-modtime',
+                '--format', 'pst', '--separator', '\t', f'{remote}/{prefix}']
+        proc = (runner or rclone_run)(argv, check=False)
+        if proc.returncode != 0:
+            msg = (proc.stderr or '').strip()
+            if 'directory not found' in msg.lower():
+                continue  # a prefix with nothing in it yet
+            raise RuntimeError(f'cannot list {remote}/{prefix}: {msg[-300:] or proc.returncode}')
+        for line in proc.stdout.splitlines():
+            parts = line.split('\t')
+            if len(parts) < 2:
+                continue
+            rel = prefix + parts[0]
+            if Path(rel).suffix.lower() not in AUDIO_SUFFIXES:
+                continue
+            try:
+                out[rel] = {'size': int(parts[1]), 'time': parts[2] if len(parts) > 2 else ''}
+            except ValueError:
+                continue
+    return out
+
+
+def _time_ns(stamp):
+    """rclone's modtime text ('2026-11-18 03:54:00' or ISO) as nanoseconds since 1970, or 0."""
+    from datetime import datetime, timezone
+    text = (stamp or '').strip().replace('T', ' ').rstrip('Z')
+    for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S'):
+        try:
+            dt = datetime.strptime(text[:26], fmt).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp()) * 1_000_000_000
+        except ValueError:
+            continue
+    return 0
+
+
+def readable_roots(roots, retries=2):
+    """The roots this process can list now. An unreadable drive is left out with a warning (on
+    19 Nov 2026 `ls` on MusicDrive failed with EINTR and failed the whole push)."""
+    ok, bad = [], []
+    for root in roots:
+        for attempt in range(retries + 1):
+            try:
+                if root.is_dir():
+                    with os.scandir(root) as it:
+                        next(it, None)
+                    ok.append(root)
+                else:
+                    bad.append(f'{root}: not mounted')
+                break
+            except OSError as exc:
+                if attempt == retries:
+                    bad.append(f'{root}: {exc}')
+                else:
+                    time.sleep(1)
+    return ok, bad
+
+
+def previous_entries(state, remote=None):
+    """The last catalogue's entries by path: the local copy, else the bucket's (fetched once)."""
+    doc = load_cached_catalogue(state)
+    if not doc and remote:
+        try:
+            doc = refresh_catalogue_cache(remote, state)
+        except (RuntimeError, OSError, ValueError):
+            doc = None
+    return {e['relativePath']: e for e in (doc or {}).get('entries') or []
+            if isinstance(e, dict) and e.get('relativePath') and e.get('sha256')}
+
+
+def build_catalogue_from_remote(remote, roots, state, *, listing=None, fetch_max=200,
+                                metered_flag=None, fetcher=None, allow_shrink=False,
+                                prefixes=DEFAULT_PREFIXES):
+    """One catalogue entry per audio object in the bucket. Returns (doc, report)."""
+    state = state_dir(state)
+    listing = remote_listing(remote, prefixes) if listing is None else listing
+    roots = _roots(roots or [])
+    usable, unreadable = readable_roots(roots)
+    prev = previous_entries(state, remote)
+    cache = load_build_cache(state)
+    metered = Path(metered_flag or METERED_FLAG).exists()
+    fetch = fetcher or (lambda rel, dest: remote_fetch_file(remote, rel, dest))
+    entries, pending, skipped = [], [], []
+    counts = {'drive': 0, 'carried': 0, 'fetched': 0}
+    tmp = None
+    try:
+        for rel in sorted(listing):
+            size = listing[rel]['size']
+            entry = None
+            for root in usable:
+                path = root / rel
+                try:
+                    st = path.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and st.st_size == size:
+                    try:
+                        entry, cache = catalogue_entry_for_file(path, root, cache)
+                        counts['drive'] += 1
+                    except OSError as exc:
+                        skipped.append(f'{path}: {exc}')
+                        entry = None
+                    break
+            if entry is None:
+                old = prev.get(rel)
+                if old and int(old.get('sizeBytes') or -1) == size:
+                    entry = old
+                    counts['carried'] += 1
+            if entry is None and not metered and counts['fetched'] < fetch_max:
+                if tmp is None:
+                    tmp = Path(tempfile.mkdtemp(prefix='catalogue-fetch-'))
+                dest = tmp / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    fetch(rel, dest)
+                    if dest.stat().st_size != size:
+                        raise OSError(f'fetched {dest.stat().st_size} bytes, bucket says {size}')
+                    entry, _ = catalogue_entry_for_file(dest, tmp, {})
+                    entry = dict(entry, mtimeNs=str(_time_ns(listing[rel].get('time')) or entry['mtimeNs']))
+                    counts['fetched'] += 1
+                except (OSError, RuntimeError) as exc:
+                    skipped.append(f'{rel}: fetch failed: {exc}')
+                    entry = None
+                finally:
+                    dest.unlink(missing_ok=True)  # inside this run's temp dir
+            if entry is None:
+                pending.append(rel)
+                continue
+            entries.append(entry)
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)  # the temp dir made above
+    save_build_cache(state, cache)
+    dropped = sorted(set(prev) - set(listing))
+    if not entries:
+        raise ValueError(f'no audio masters listed under {remote}')
+    if prev and not allow_shrink and len(entries) < SHRINK_GUARD * len(prev):
+        raise ValueError(f'refusing to publish {len(entries)} entries over the previous {len(prev)} '
+                         f'(more than {int((1 - SHRINK_GUARD) * 100)}% fewer); --allow-shrink if that is right')
+    doc = {'schemaVersion': CATALOGUE_SCHEMA, 'generatedAt': int(time.time()), 'source': 'remote', 'entries': entries}
+    report = {'listed': len(listing), 'entries': len(entries), **counts, 'pending': len(pending),
+              'firstPending': pending[:5], 'dropped': len(dropped), 'firstDropped': dropped[:5],
+              'unreadableRoots': unreadable, 'skipped': len(skipped), 'firstSkipped': skipped[:5],
+              'metered': metered}
+    return doc, report
+
+
+def atomic_write_json(path, document):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, prefix=f'.{path.name}-', delete=False) as stream:
+            temp = Path(stream.name)
+            json.dump(document, stream, indent=2, ensure_ascii=False)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        if temp:
+            temp.unlink(missing_ok=True)
+
+
+ARCHIVE_DIR_NAME = '_metadata'
+
+
+def catalogue_command(masters_dir, remote, state, upload=True, archive=True, from_remote=False,
+                      fetch_max=200, allow_shrink=False, prefixes=DEFAULT_PREFIXES, aliases=None):
+    """Build and publish catalogue.json (and, from the bucket, the alias table music/ids.json).
+
+    from_remote: the bucket's listing is the catalogue (the nightly push since 19 Nov 2026); the
+    roots only supply hashes and tags. Otherwise the roots are walked (tests and one-off use)."""
+    state = state_dir(state)
+    report = None
+    if from_remote:
+        doc, report = build_catalogue_from_remote(remote, masters_dir, state, fetch_max=fetch_max,
+                                                  allow_shrink=allow_shrink, prefixes=prefixes)
+    else:
+        doc = build_catalogue(masters_dir, state)
+    local_out = state / 'catalogue.json'
+    atomic_write_json(local_out, doc)
+    if archive:
+        # The record lives with the masters, on the same drive (owner rule, 12 Nov 2026): on every
+        # pool this run could read. A drive that cannot be written is a warning, not a failed build.
+        roots = readable_roots(_roots(masters_dir or []))[0]
+        for root in roots:
+            try:
+                atomic_write_json(root / ARCHIVE_DIR_NAME / 'library-metadata.json', doc)
+            except OSError as exc:
+                print(f'catalogue: could not write the metadata record beside the masters ({root}): {exc}',
+                      file=sys.stderr)
+    if upload:
+        upload_local_json(local_out, remote, 'catalogue.json')
+    if from_remote:
+        ids_doc = publish_ids(doc, state, remote, upload=upload, aliases=aliases)
+        report['ids'] = ids_doc.get('counts')
+    if report is not None:
+        doc = dict(doc, report=report)
+    return doc
+
+
+def publish_ids(doc, state, remote, upload=True, aliases=None):
+    """The alias table, built from this catalogue (the catalogue builder is its only writer)."""
+    store = _music_store()
+    prev = store.load_json(state / 'ids.json', {})
+    ids_doc = store.build_ids(doc['entries'], claims=store.read_claims(aliases or []), previous=prev)
+    out = state / 'ids.json'
+    atomic_write_json(out, ids_doc)
+    if upload:
+        rclone_run(['copyto', str(out), f'{remote}/{store.IDS_KEY}'])
+    return ids_doc
+
+
+def _music_store():
+    here = Path(__file__).resolve().parent
+    for cand in (here, here.parent / 'store', here.parent / 'music-store', HOME / 'Projects/music-core/store'):
+        if (cand / 'musicstore.py').is_file() and str(cand) not in sys.path:
+            sys.path.insert(0, str(cand))
+    import musicstore
+    return musicstore
+
+
+def push_command(masters_dir, remote):
+    for masters in _roots(masters_dir):
+        rclone_run(['copy', str(masters), remote, '--checksum'])
+
+
+def load_requests(path):
+    path = Path(path).expanduser()
+    doc = json.loads(path.read_text())
+    if doc.get('schemaVersion') != 1 or not isinstance(doc.get('playlists'), list):
+        raise ValueError('unsupported offline-requests schema')
+    return doc
+
+
+def track_duration_seconds(track):
+    for key in ('durationSeconds', 'duration'):
+        val = track.get(key)
+        if val is None or val == '':
+            continue
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def duration_ok(request_dur, entry_dur, tolerance=2.0):
+    if request_dur is None or entry_dur is None:
+        return True
+    return abs(request_dur - entry_dur) <= tolerance
+
+
+_MATCH_INDEX = {}
+
+
+def catalogue_match_index(catalogue_entries):
+    """Match key -> catalogue entries, built once per entries list.
+
+    Without it every track recomputed the keys of every catalogue entry: a status read over
+    1,500 tracks and 1,300 entries took 17 s of CPU (11 Nov 2026), and the app asks for one
+    every 30 s.
+    """
+    cached = _MATCH_INDEX.get(id(catalogue_entries))
+    if cached and cached[0] is catalogue_entries and cached[1] == len(catalogue_entries):
+        return cached[2]
+    index = {}
+    for position, entry in enumerate(catalogue_entries):
+        tags = entry.get('tags') or {}
+        for key in oc.catalogue_match_keys(tags.get('artist', ''), tags.get('title', '')):
+            index.setdefault(key, []).append((position, entry))
+    _MATCH_INDEX.clear()
+    _MATCH_INDEX[id(catalogue_entries)] = (catalogue_entries, len(catalogue_entries), index)
+    return index
+
+
+def match_track(track, catalogue_entries):
+    """Return (matches, reason). matches is a list of entries; reason set when empty."""
+    req_keys = oc.catalogue_match_keys(track.get('artist', ''), track.get('title', ''))
+    if not req_keys:
+        return [], 'missing title or artist'
+    req_dur = track_duration_seconds(track)
+    exact_key = match_key(track.get('artist', ''), track.get('title', ''))
+    index = catalogue_match_index(catalogue_entries)
+    candidates = {}
+    for key in req_keys:
+        for position, entry in index.get(key, ()):
+            candidates[position] = entry
+    hits = []
+    for position in sorted(candidates):
+        entry = candidates[position]
+        tags = entry.get('tags') or {}
+        entry_dur = entry.get('durationSeconds') or None   # 0.0 in old catalogues means unknown
+        if not duration_ok(req_dur, entry_dur):
+            continue
+        exact = match_key(tags.get('artist', ''), tags.get('title', '')) == exact_key
+        if not exact and (req_dur is None or entry_dur is None):
+            # A loose match (suffix, "feat.", primary artist) is only trusted when the
+            # durations confirm it is the same recording.
+            continue
+        hits.append(entry)
+    if not hits:
+        return [], 'no catalogue match'
+    if len(hits) > 1:
+        paths = {h['relativePath'] for h in hits}
+        if len(paths) > 1:
+            return [], 'ambiguous catalogue match'
+    return hits, None
+
+
+def safe_relpath(rel):
+    """A catalogue path is trusted only as a relative audio path with no '..' parts.
+
+    The catalogue is fetched from the remote, so a bad or tampered entry must never be able
+    to name a file outside hot_dir.
+    """
+    if not isinstance(rel, str) or not rel or '\x00' in rel or '\\' in rel:
+        return False
+    parts = rel.split('/')
+    if rel.startswith('/') or any(part in ('', '.', '..') for part in parts):
+        return False
+    return os.path.splitext(rel)[1].lower() in AUDIO_SUFFIXES
+
+
+def inside(root, rel):
+    """The destination for rel, or None when it would resolve outside root (e.g. via a symlink)."""
+    root = Path(root).resolve()
+    dest = (root / rel).resolve()
+    return dest if root in dest.parents else None
+
+
+def index_catalogue(catalogue):
+    return [entry for entry in (catalogue.get('entries') or [])
+            if isinstance(entry, dict) and safe_relpath(entry.get('relativePath'))]
+
+
+def hot_file_state(hot_dir):
+    hot = Path(hot_dir).expanduser()
+    rows = {}
+    if not hot.is_dir():
+        return rows
+    for path in hot.rglob('*'):
+        if path.suffix.lower() not in AUDIO_SUFFIXES or not path.is_file():
+            continue
+        rel = str(path.relative_to(hot))
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        rows[rel] = {
+            'relativePath': rel,
+            'path': str(path),
+            'sizeBytes': st.st_size,
+            'mtime': st.st_mtime,
+        }
+    return rows
+
+
+def load_played(state):
+    p = state_dir(state) / 'played.json'
+    try:
+        doc = json.loads(p.read_text())
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def load_fetched(state):
+    p = state_dir(state) / 'fetched.json'
+    try:
+        doc = json.loads(p.read_text())
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def save_fetched(state, fetched):
+    atomic_write_json(state_dir(state) / 'fetched.json', fetched)
+
+
+def load_cached_catalogue(state):
+    p = state_dir(state) / 'catalogue.json'
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def refresh_catalogue_cache(remote, state):
+    dest = state_dir(state) / 'catalogue.json'
+    fetch_remote_json(remote, 'catalogue.json', dest)
+    return json.loads(dest.read_text())
+
+
+def merge_extra_requests(requests_doc, extra_path=None):
+    """Add the radio's playlists (schema 1) to the app's requests; a missing or bad file adds nothing,
+    and a key the app already requests is left to the app."""
+    path = Path(extra_path or RADIO_REQUESTS).expanduser()
+    try:
+        extra = load_requests(path)
+    except (OSError, ValueError):
+        return requests_doc
+    keys = {p.get('key') for p in requests_doc['playlists']}
+    merged = dict(requests_doc)
+    merged['playlists'] = list(requests_doc['playlists']) + [p for p in extra['playlists'] if p.get('key') not in keys]
+    return merged
+
+
+def wanted_entries_from_requests(requests_doc, catalogue, max_tracks=120):
+    entries = index_catalogue(catalogue)
+    playlists = []
+    library_playlists = []
+    unmatched = []
+    wanted_by_rel = {}
+    for playlist in requests_doc['playlists']:
+        key = playlist.get('key', '')
+        title = playlist.get('title', key)
+        track_rows = playlist.get('tracks') or []
+        if len(track_rows) > max_tracks:
+            library_playlists.append({
+                'key': key,
+                'title': title,
+                'wanted': len(track_rows),
+                'library': True,
+            })
+            continue
+        pl_wanted = []
+        for track in track_rows:
+            matches, reason = match_track(track, entries)
+            item = {
+                'playlistKey': key,
+                'playlistTitle': title,
+                'track': {k: track.get(k, '') for k in ('id', 'title', 'artist', 'album')},
+            }
+            if not matches:
+                unmatched.append(dict(item, reason=reason))
+                continue
+            entry = matches[0]
+            row = dict(item, catalogue=entry)
+            pl_wanted.append(row)
+            wanted_by_rel[entry['relativePath']] = row
+        playlists.append({'key': key, 'title': title, 'tracks': pl_wanted})
+    return playlists, list(wanted_by_rel.values()), unmatched, library_playlists
+
+
+def playlist_fetch_order(to_fetch, playlist_first=None):
+    order = []
+    seen = set()
+    if playlist_first:
+        order.append(playlist_first)
+        seen.add(playlist_first)
+    for row in to_fetch:
+        key = row.get('playlistKey')
+        if key and key not in seen:
+            order.append(key)
+            seen.add(key)
+    return order
+
+
+def group_to_fetch_by_playlist(to_fetch):
+    grouped = {}
+    for row in to_fetch:
+        grouped.setdefault(row.get('playlistKey'), []).append(row)
+    return grouped
+
+
+def bytes_in_hot(hot_map):
+    return sum(row['sizeBytes'] for row in hot_map.values())
+
+
+def part_bytes_in_hot(hot_dir):
+    hot = Path(hot_dir).expanduser()
+    total = 0
+    if not hot.is_dir():
+        return total
+    for path in hot.rglob('*.part'):
+        if path.is_file():
+            try:
+                total += path.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def hot_byte_usage(hot_dir, hot_map=None):
+    hot_map = hot_map if hot_map is not None else hot_file_state(hot_dir)
+    return bytes_in_hot(hot_map) + part_bytes_in_hot(hot_dir)
+
+
+def sweep_stale_parts(hot_dir):
+    removed = []
+    hot = Path(hot_dir).expanduser()
+    if not hot.is_dir():
+        return removed
+    for path in hot.rglob('*.part'):
+        if path.is_file():
+            try:
+                path.unlink()
+                removed.append(str(path))
+            except OSError:
+                pass
+    return removed
+
+
+def load_verified_hot(state):
+    p = state_dir(state) / 'verified-hot.json'
+    try:
+        doc = json.loads(p.read_text())
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def save_verified_hot(state, verified):
+    atomic_write_json(state_dir(state) / 'verified-hot.json', verified)
+
+
+def verify_hot_track(path, entry, verified_state, rel):
+    """Return (ok, digest). Cheap when size+mtime match the last verified record."""
+    p = Path(path)
+    st = p.stat()
+    expected_size = int(entry['sizeBytes'])
+    if st.st_size != expected_size:
+        return False, None
+    stamp = [st.st_size, str(st.st_mtime_ns)]
+    prev = verified_state.get(rel, {})
+    if prev.get('stamp') == stamp and prev.get('sha256') == entry.get('sha256'):
+        return True, prev['sha256']
+    digest = sha256_file(p)
+    if digest != entry.get('sha256'):
+        return False, digest
+    verified_state[rel] = {'stamp': stamp, 'sha256': digest}
+    return True, digest
+
+
+def reconcile_wanted_hot(hot_dir, wanted_entries, verified_state, trash_cmd=None):
+    """Trash corrupt hot files; return (local_ok, refetch)."""
+    hot_map = hot_file_state(hot_dir)
+    local = []
+    refetch = []
+    hot_dir = Path(hot_dir).expanduser().resolve()
+    for item in wanted_entries:
+        rel = item['catalogue']['relativePath']
+        if rel not in hot_map:
+            refetch.append(item)
+            continue
+        row = hot_map[rel]
+        path = Path(row['path']).resolve()
+        if not path.is_relative_to(hot_dir):
+            refetch.append(item)
+            continue
+        ok, _ = verify_hot_track(path, item['catalogue'], verified_state, rel)
+        if ok:
+            local.append(dict(item, path=str(path)))
+            continue
+        trash_path(path, trash_cmd=trash_cmd)
+        verified_state.pop(rel, None)
+        refetch.append(item)
+    return local, refetch
+
+
+def prioritize_to_fetch(to_fetch, playlist_key=None):
+    if not playlist_key:
+        return list(to_fetch)
+    first = [row for row in to_fetch if row.get('playlistKey') == playlist_key]
+    rest = [row for row in to_fetch if row.get('playlistKey') != playlist_key]
+    return first + rest
+
+
+def catalogue_index(catalogue):
+    return {e['relativePath']: e for e in index_catalogue(catalogue)}
+
+
+def activity_timestamp(rel, played, fetched, hot_row, now):
+    ts = [hot_row.get('mtime', 0)]
+    if rel in played:
+        ts.append(float(played[rel]))
+    if rel in fetched:
+        ts.append(float(fetched[rel]))
+    return max(ts)
+
+
+def evictable_files(hot_map, wanted_rels, played, fetched, remote_rels, keep_days, now):
+    cutoff = now - keep_days * 86400
+    candidates = []
+    for rel, row in hot_map.items():
+        if rel in wanted_rels:
+            continue
+        act = activity_timestamp(rel, played, fetched, row, now)
+        if act >= cutoff:
+            continue
+        if rel not in remote_rels:
+            continue
+        candidates.append({
+            'relativePath': rel,
+            'sizeBytes': row['sizeBytes'],
+            'path': row['path'],
+            'lastActivity': act,
+        })
+    candidates.sort(key=lambda r: r['lastActivity'])
+    return candidates
+
+
+def plan_evictions(hot_dir, hot_map, wanted_rels, played, fetched, remote_rels, cap_bytes, keep_days, now,
+                   extra_fetch_bytes=0):
+    hot_bytes = hot_byte_usage(hot_dir, hot_map)
+    target = hot_bytes + extra_fetch_bytes - cap_bytes
+    evict = []
+    if target <= 0:
+        return evict
+    for row in evictable_files(hot_map, wanted_rels, played, fetched, remote_rels, keep_days, now):
+        evict.append(row)
+        target -= row['sizeBytes']
+        if target <= 0:
+            break
+    return evict
+
+
+def compute_plan(requests_doc, catalogue, hot_dir, played, fetched, remote_rels, cap_bytes, keep_days,
+                 now=None, verified_state=None, trash_cmd=None, playlist_first=None, max_tracks=120):
+    now = now if now is not None else time.time()
+    playlists, wanted_entries, unmatched, library_playlists = wanted_entries_from_requests(
+        requests_doc, catalogue, max_tracks=max_tracks)
+    wanted_rels = {e['catalogue']['relativePath'] for e in wanted_entries}
+    hot_map = hot_file_state(hot_dir)
+    verified_state = verified_state if verified_state is not None else {}
+    local, to_fetch = reconcile_wanted_hot(hot_dir, wanted_entries, verified_state, trash_cmd=trash_cmd)
+    to_fetch = prioritize_to_fetch(to_fetch, playlist_first)
+    fetch_bytes = sum(e['catalogue']['sizeBytes'] for e in to_fetch)
+    evict = plan_evictions(hot_dir, hot_map, wanted_rels, played, fetched, remote_rels, cap_bytes, keep_days, now,
+                            extra_fetch_bytes=fetch_bytes)
+    hot_bytes = hot_byte_usage(hot_dir, hot_map)
+    after_evict = hot_bytes - sum(r['sizeBytes'] for r in evict) + fetch_bytes
+    overflow = after_evict > cap_bytes
+    evict_rows = []
+    for row in evict:
+        entry = catalogue_index(catalogue).get(row['relativePath'], {})
+        evict_rows.append({
+            'relativePath': row['relativePath'],
+            'sizeBytes': row['sizeBytes'],
+            'catalogue': {k: entry.get(k) for k in ('relativePath', 'sizeBytes', 'sha256')},
+        })
+    return {
+        'schemaVersion': PLAN_SCHEMA,
+        'generatedAt': int(now),
+        'playlists': playlists,
+        'library': library_playlists,
+        'wantedCount': len(wanted_entries),
+        'local': local,
+        'toFetch': to_fetch,
+        'unmatched': unmatched,
+        'evict': evict_rows,
+        'hotBytes': hot_bytes,
+        'capBytes': cap_bytes,
+        'afterSyncBytes': after_evict,
+        'overflow': overflow,
+    }
+
+
+def metered_active(flag_path=None):
+    p = Path(flag_path) if flag_path else METERED_FLAG
+    return p.exists()
+
+
+def acquire_lock(state):
+    state = state_dir(state)
+    state.mkdir(parents=True, exist_ok=True)
+    lock_path = state / 'sync.lock'
+    handle = lock_path.open('a')
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise BlockingIOError('another music-library sync is active')
+    return handle, lock_path
+
+
+def verify_and_install(part_path, final_path, expected_sha256, expected_size):
+    part = Path(part_path)
+    st = part.stat()
+    if st.st_size != expected_size:
+        part.unlink(missing_ok=True)
+        raise ValueError(f'size mismatch for {final_path.name}')
+    digest = sha256_file(part)
+    if digest != expected_sha256:
+        part.unlink(missing_ok=True)
+        raise ValueError(f'sha256 mismatch for {final_path.name}')
+    final = Path(final_path)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    part.replace(final)
+
+
+def trash_path(path, trash_cmd=None):
+    cmd = Path(trash_cmd) if trash_cmd else TRASH
+    if not cmd.is_file():
+        raise RuntimeError(f'trash helper missing: {cmd}')
+    subprocess.run([str(cmd), str(path)], check=True)
+
+
+def sync_execute(plan, cfg, state, remote_rels, allow_metered=False, metered_flag=None, trash_cmd=None, now=None,
+                 remote_meta=None, playlist_first=None):
+    now = now if now is not None else time.time()
+    state_p = state_dir(state)
+    if metered_active(metered_flag) and not allow_metered:
+        raise ValueError('metered link; refuse fetch (use --allow-metered)')
+    hot_dir = Path(cfg['hot_dir']).expanduser().resolve()
+    cap_bytes = int(plan['capBytes'])
+    min_free = min_free_bytes_from_config(cfg)
+    meta_lookup = remote_meta if remote_meta is not None else remote_object_meta
+    fetched = load_fetched(state)
+    verified_hot = load_verified_hot(state)
+    sweep_stale_parts(hot_dir)
+    hot_map = hot_file_state(hot_dir)
+    hot_bytes = hot_byte_usage(hot_dir, hot_map)
+    eviction_skipped = []
+    for ev in plan['evict']:
+        rel = ev['relativePath']
+        row = hot_map.get(rel)
+        if not row:
+            continue
+        path = Path(row['path']).resolve()
+        if not path.is_relative_to(hot_dir):
+            raise ValueError(f'refuse evict outside hot_dir: {path}')
+        entry = ev.get('catalogue') or {}
+        if not entry.get('sha256'):
+            eviction_skipped.append({'relativePath': rel, 'reason': 'missing catalogue entry'})
+            continue
+        ok, reason = remote_confirms_catalogue(cfg['remote'], rel, entry, meta=meta_lookup(cfg['remote'], rel))
+        if not ok:
+            eviction_skipped.append({'relativePath': rel, 'reason': reason})
+            continue
+        trash_path(path, trash_cmd=trash_cmd)
+        fetched.pop(rel, None)
+        verified_hot.pop(rel, None)
+        hot_map.pop(rel, None)
+        hot_bytes -= row['sizeBytes']
+    to_fetch = prioritize_to_fetch(plan['toFetch'], playlist_first)
+    by_playlist = group_to_fetch_by_playlist(to_fetch)
+    skipped_playlists = []
+    fetched_count = 0
+    for key in playlist_fetch_order(to_fetch, playlist_first):
+        items = by_playlist.get(key, [])
+        if not items:
+            continue
+        need_bytes = sum(int(item['catalogue']['sizeBytes']) for item in items)
+        title = items[0].get('playlistTitle', key)
+        if hot_bytes + need_bytes > cap_bytes:
+            skipped_playlists.append({'key': key, 'title': title, 'reason': 'cap', 'needBytes': need_bytes})
+            continue
+        for item in items:
+            entry = item['catalogue']
+            rel = entry['relativePath']
+            size = int(entry['sizeBytes'])
+            if hot_bytes + size > cap_bytes:
+                skipped_playlists.append({'key': key, 'title': title, 'reason': 'cap', 'needBytes': need_bytes})
+                break
+            free_disk = physical_free_bytes(hot_dir)
+            if free_disk - size < min_free:
+                raise ValueError(f'free disk would fall below min_free_gb fetching {rel!r}')
+            dest = inside(hot_dir, rel) if safe_relpath(rel) else None
+            if dest is None:
+                raise ValueError('refusing to fetch outside the hot directory: %r' % (rel,))
+            part = dest.with_suffix(dest.suffix + '.part')
+            part.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                remote_fetch_file(cfg['remote'], rel, part)
+                verify_and_install(part, dest, entry['sha256'], entry['sizeBytes'])
+            except (OSError, ValueError, RuntimeError):
+                part.unlink(missing_ok=True)
+                raise
+            fetched[rel] = now
+            st = dest.stat()
+            verified_hot[rel] = {'stamp': [st.st_size, str(st.st_mtime_ns)], 'sha256': entry['sha256']}
+            hot_bytes += size
+            fetched_count += 1
+    save_fetched(state, fetched)
+    save_verified_hot(state, verified_hot)
+    status = {
+        'lastSyncAt': int(now),
+        'lastError': None,
+        'fetched': fetched_count,
+        'evictionSkipped': eviction_skipped,
+        'skipped': skipped_playlists,
+        'library': plan.get('library') or [],
+        'plan': {k: plan.get(k) for k in ('wantedCount', 'hotBytes', 'capBytes', 'afterSyncBytes')},
+    }
+    atomic_write_json(state_p / 'last-status.json', status)
+    return status
+
+
+def touch_played(path, state, config=None, now=None):
+    now = now if now is not None else time.time()
+    path = Path(path).expanduser()
+    cfg = load_config(config)
+    hot = cfg['hot_dir'].resolve()
+    path_resolved = path.resolve()
+    if not path_resolved.is_file():
+        raise ValueError('touch path is not a file')
+    try:
+        rel = str(path_resolved.relative_to(hot))
+    except ValueError:
+        rel = str(path)
+    played = load_played(state)
+    played[rel] = now
+    atomic_write_json(state_dir(state) / 'played.json', played)
+    return rel, now
+
+
+def build_status(requests_doc, catalogue, cfg, state, last_status):
+    limit = max_playlist_tracks(cfg)
+    _, wanted_entries, _, library_from_requests = wanted_entries_from_requests(
+        requests_doc, catalogue, max_tracks=limit)
+    wanted_rels = {e['catalogue']['relativePath'] for e in wanted_entries}
+    hot_map = hot_file_state(cfg['hot_dir'])
+    local_rels = set(hot_map) & wanted_rels
+    skipped = []
+    library = []
+    if isinstance(last_status, dict):
+        skipped = last_status.get('skipped') or []
+        library = last_status.get('library') or []
+    skipped_keys = {row.get('key') for row in skipped if isinstance(row, dict) and row.get('key')}
+    library_keys = {row.get('key') for row in library_from_requests if isinstance(row, dict) and row.get('key')}
+    for row in library:
+        if isinstance(row, dict) and row.get('key'):
+            library_keys.add(row['key'])
+    per_playlist = []
+    any_missing = False
+    entries = index_catalogue(catalogue)
+
+    def playlist_counts(tracks):
+        wanted = len(tracks)
+        local_count = 0
+        unmatched = 0
+        for track in tracks:
+            matches, reason = match_track(track, entries)
+            if not matches:
+                if reason:
+                    unmatched += 1
+                continue
+            if matches[0]['relativePath'] in hot_map:
+                local_count += 1
+        missing = wanted - local_count - unmatched
+        return wanted, local_count, max(0, missing), unmatched
+
+    for playlist in requests_doc['playlists']:
+        key = playlist.get('key', '')
+        title = playlist.get('title', key)
+        tracks = playlist.get('tracks') or []
+        is_library = key in library_keys or len(tracks) > limit
+        wanted, local_count, missing, unmatched = playlist_counts(tracks)
+        row = {
+            'name': title,
+            'key': key,
+            'wanted': wanted,
+            'local': local_count,
+            'missing': missing,
+            'unmatched': unmatched,
+            'library': is_library,
+        }
+        per_playlist.append(row)
+        if is_library or key in skipped_keys:
+            continue
+        if missing > 0:
+            any_missing = True
+    last_err = None
+    last_sync = None
+    if isinstance(last_status, dict):
+        last_err = last_status.get('lastError')
+        last_sync = last_status.get('lastSyncAt')
+    failed = bool(last_err)
+    library_rows = list(library_from_requests)
+    for row in library:
+        if isinstance(row, dict) and row not in library_rows:
+            library_rows.append(row)
+    return {
+        'schemaVersion': STATUS_SCHEMA,
+        'playlists': per_playlist,
+        'library': library_rows,
+        'skipped': skipped,
+        'hotBytes': bytes_in_hot(hot_map),
+        'capBytes': cap_bytes_from_config(cfg),
+        'wantedLocal': len(local_rels),
+        'wantedTotal': len(wanted_rels),
+        'lastSyncAt': last_sync,
+        'lastError': last_err,
+        'healthy': not any_missing and not failed,
+    }
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    sub = p.add_subparsers(dest='command', required=True)
+
+    c_cat = sub.add_parser('catalogue', help='build and publish catalogue.json (and ids.json with --from-remote)')
+    c_cat.add_argument('--masters', type=Path, action='append',
+                       help='repeat for each masters pool (default: masters_roots in the config)')
+    c_cat.add_argument('--from-remote', action='store_true',
+                       help="the bucket's listing is the catalogue; the roots only supply hashes and tags")
+    c_cat.add_argument('--fetch-max', type=int, help='at most this many new objects fetched from the bucket per run')
+    c_cat.add_argument('--allow-shrink', action='store_true')
+    c_cat.add_argument('--config', type=Path)
+    c_cat.add_argument('--state', type=Path)
+    c_cat.add_argument('--no-upload', action='store_true')
+    c_cat.add_argument('--no-archive', action='store_true', help='do not write _metadata/library-metadata.json beside the masters')
+
+    c_roots = sub.add_parser('roots', help='print the configured masters roots, one a line')
+    c_roots.add_argument('--config', type=Path)
+
+    c_push = sub.add_parser('push', help='rclone copy masters to remote (no deletes)')
+    c_push.add_argument('--masters', type=Path, action='append', help='repeat for each masters pool')
+    c_push.add_argument('--config', type=Path)
+
+    c_plan = sub.add_parser('plan', help='compute hot-set plan JSON')
+    c_plan.add_argument('--requests', type=Path, default=DEFAULT_REQUESTS)
+    c_plan.add_argument('--config', type=Path)
+    c_plan.add_argument('--state', type=Path)
+    c_plan.add_argument('--refresh-catalogue', action='store_true')
+
+    c_sync = sub.add_parser('sync', help='execute plan (fetch + evict)')
+    c_sync.add_argument('--requests', type=Path, default=DEFAULT_REQUESTS)
+    c_sync.add_argument('--config', type=Path)
+    c_sync.add_argument('--state', type=Path)
+    c_sync.add_argument('--allow-metered', action='store_true')
+    c_sync.add_argument('--refresh-catalogue', action='store_true')
+    c_sync.add_argument('--playlist', dest='playlist_key', metavar='KEY', help='fetch this playlist first')
+
+    c_status = sub.add_parser('status', help='JSON status for morning check')
+    c_status.add_argument('--requests', type=Path, default=DEFAULT_REQUESTS)
+    c_status.add_argument('--config', type=Path)
+    c_status.add_argument('--state', type=Path)
+
+    c_touch = sub.add_parser('touch', help='record play time for eviction')
+    c_touch.add_argument('path', type=Path)
+    c_touch.add_argument('--config', type=Path)
+    c_touch.add_argument('--state', type=Path)
+
+    args = p.parse_args(argv)
+    try:
+        if args.command == 'catalogue':
+            cfg = load_config(args.config)
+            roots = args.masters or cfg['masters_roots']
+            if not roots and not args.from_remote:
+                raise ValueError('no masters roots: pass --masters or set masters_roots in the config')
+            doc = catalogue_command(roots, cfg['remote'], args.state, upload=not args.no_upload,
+                                    archive=not args.no_archive, from_remote=args.from_remote,
+                                    fetch_max=args.fetch_max if args.fetch_max is not None else cfg['catalogue_fetch_max'],
+                                    allow_shrink=args.allow_shrink, prefixes=cfg['catalogue_prefixes'],
+                                    aliases=cfg['alias_inputs'])
+            incomplete = []
+            for entry in doc['entries']:
+                gaps = trackmeta.metadata_gaps({**(entry.get('meta') or {}), **(entry.get('tags') or {}),
+                                                'art': (entry.get('meta') or {}).get('art'),
+                                                'durationSeconds': entry.get('durationSeconds')})
+                if gaps:
+                    incomplete.append({'relativePath': entry['relativePath'], 'missing': gaps})
+            print(json.dumps({'entries': len(doc['entries']), 'remote': cfg['remote'],
+                              'metadataIncomplete': len(incomplete), 'firstIncomplete': incomplete[:5],
+                              **({'report': doc['report']} if doc.get('report') else {})},
+                             indent=2, ensure_ascii=False))
+            return 0
+        if args.command == 'roots':
+            for root in load_config(args.config)['masters_roots']:
+                print(root)
+            return 0
+        if args.command == 'push':
+            cfg = load_config(args.config)
+            push_command(args.masters or cfg['masters_roots'], cfg['remote'])
+            return 0
+        if args.command == 'touch':
+            rel, ts = touch_played(args.path, args.state, config=args.config)
+            print(json.dumps({'relativePath': rel, 'playedAt': ts}))
+            return 0
+
+        cfg = load_config(getattr(args, 'config', None))
+        state = args.state if hasattr(args, 'state') else None
+        cap_bytes = cap_bytes_from_config(cfg)
+        requests_doc = load_requests(args.requests)
+        if Path(args.requests).expanduser() == DEFAULT_REQUESTS:
+            requests_doc = merge_extra_requests(requests_doc)
+        metered = metered_active()
+        allow_metered = getattr(args, 'allow_metered', False)
+        cached_catalogue_note = False
+
+        if args.command == 'sync' and metered and not allow_metered:
+            raise ValueError('metered link; refuse sync before remote calls (use --allow-metered)')
+
+        if args.command in ('plan', 'sync', 'status'):
+            if metered and not allow_metered:
+                catalogue = load_cached_catalogue(state)
+                if catalogue is None:
+                    raise ValueError('metered link; no cached catalogue')
+                cached_catalogue_note = True
+            elif getattr(args, 'refresh_catalogue', False) or load_cached_catalogue(state) is None:
+                if not rclone_bin():
+                    raise RuntimeError('rclone required to refresh catalogue')
+                catalogue = refresh_catalogue_cache(cfg['remote'], state)
+            else:
+                catalogue = load_cached_catalogue(state)
+
+        if args.command == 'plan':
+            if metered and not allow_metered:
+                remote_rels = {e['relativePath'] for e in index_catalogue(catalogue)}
+            elif rclone_bin():
+                remote_rels = remote_list_files(cfg['remote'])
+            else:
+                remote_rels = {e['relativePath'] for e in index_catalogue(catalogue)}
+            verified = load_verified_hot(state)
+            plan = compute_plan(requests_doc, catalogue, cfg['hot_dir'], load_played(state), load_fetched(state),
+                                remote_rels, cap_bytes, cfg['keep_days'], verified_state=verified,
+                                playlist_first=getattr(args, 'playlist_key', None),
+                                max_tracks=max_playlist_tracks(cfg))
+            if cached_catalogue_note:
+                plan['catalogueSource'] = 'cache'
+                plan['metered'] = True
+            print(json.dumps(plan, indent=2, ensure_ascii=False))
+            return 2 if plan['unmatched'] or plan['overflow'] else 0
+
+        if args.command == 'status':
+            last_status = {}
+            try:
+                last_status = json.loads((state_dir(state) / 'last-status.json').read_text())
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+            doc = build_status(requests_doc, catalogue, cfg, state, last_status)
+            if cached_catalogue_note:
+                doc['catalogueSource'] = 'cache'
+                doc['metered'] = True
+            print(json.dumps(doc, indent=2, ensure_ascii=False))
+            return 0 if doc['healthy'] else 1
+
+        if args.command == 'sync':
+            lock = None
+            try:
+                lock, _ = acquire_lock(state)
+                if metered and not allow_metered:
+                    raise ValueError('metered link; refuse sync before remote calls (use --allow-metered)')
+                if getattr(args, 'refresh_catalogue', False) or load_cached_catalogue(state) is None:
+                    catalogue = refresh_catalogue_cache(cfg['remote'], state)
+                else:
+                    catalogue = load_cached_catalogue(state)
+                remote_rels = remote_list_files(cfg['remote'])
+                verified = load_verified_hot(state)
+                plan = compute_plan(requests_doc, catalogue, cfg['hot_dir'], load_played(state), load_fetched(state),
+                                    remote_rels, cap_bytes, cfg['keep_days'], verified_state=verified,
+                                    playlist_first=getattr(args, 'playlist_key', None),
+                                    max_tracks=max_playlist_tracks(cfg))
+                status = sync_execute(plan, cfg, state, remote_rels, allow_metered=allow_metered,
+                                      playlist_first=getattr(args, 'playlist_key', None))
+                print(json.dumps({
+                    'synced': True,
+                    'fetched': status.get('fetched', len(plan['toFetch'])),
+                    'evicted': len(plan['evict']) - len(status.get('evictionSkipped') or []),
+                    'evictionSkipped': status.get('evictionSkipped') or [],
+                }, indent=2))
+                return 0
+            except BlockingIOError as exc:
+                p.exit(75, str(exc) + '\n')
+            finally:
+                if lock:
+                    lock.close()
+        return 0
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError, subprocess.CalledProcessError) as exc:
+        state_p = state_dir(getattr(args, 'state', None))
+        try:
+            atomic_write_json(state_p / 'last-status.json', {
+                'lastSyncAt': None,
+                'lastError': str(exc),
+            })
+        except OSError:
+            pass
+        p.exit(1, 'music-library: ' + str(exc) + '\n')
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

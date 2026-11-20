@@ -1,0 +1,10 @@
+{
+  "radio_enabled": true,
+  "tracks_per_week": 200,
+  "gb_per_week": 10,
+  "radio_max_candidates": 40,
+  "radio_max_single": 10,
+  "backcatalogue_enabled": true,
+  "acquire_via": "lane",
+  "lane_inbox": "hub:.local/state/music-radio-fetch/lane-inbox"
+}

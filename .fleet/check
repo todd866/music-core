@@ -1,0 +1,7 @@
+# Read by `fleet morning` (see fleet/docs/morning.md).
+# Unified health check across M2 + M5 for the music-core, 6IAN radio, Glancebar music, and TV music stack.
+command = "pipeline/check.py"
+max_runtime_s = 30
+where = "any"
+result = "~/.local/state/music-core/check.json"
+max_age_h = 30

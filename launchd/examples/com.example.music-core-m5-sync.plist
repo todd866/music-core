@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.music-core-m5-sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>REPLACE_HOME/Projects/music-core/pipeline/m5-sync.sh</string>
+  </array>
+  <key>StartInterval</key><integer>14400</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>REPLACE_HOME/.local/state/music-core/m5-sync.out.log</string>
+  <key>StandardErrorPath</key><string>REPLACE_HOME/.local/state/music-core/m5-sync.err.log</string>
+</dict>
+</plist>

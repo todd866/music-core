@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.music-core-nightly</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>REPLACE_HOME/.local/bin/utc-daily</string>
+    <string>--label</string><string>com.example.music-core-nightly</string>
+    <string>--at</string><string>19:40</string>
+    <string>--</string>
+    <string>/bin/zsh</string>
+    <string>REPLACE_HOME/Projects/music-core/pipeline/m2-nightly.sh</string>
+  </array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>REPLACE_HOME/.local/state/music-core/m2-nightly.out.log</string>
+  <key>StandardErrorPath</key><string>REPLACE_HOME/.local/state/music-core/m2-nightly.err.log</string>
+</dict>
+</plist>

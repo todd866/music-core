@@ -1,0 +1,6 @@
+{
+  "remote": "music-bucket:music-bucket",
+  "host": "hub",
+  "youtube_dirs": ["/Volumes/Media/music-videos"],
+  "import_radio": false
+}

@@ -1,0 +1,8 @@
+{
+  "remote": "music-bucket:music-bucket",
+  "hot_dir": "~/Music/Lossless Hot Set",
+  "cap_gb": 15,
+  "keep_days": 14,
+  "min_free_gb": 20,
+  "masters_roots": ["/Volumes/Music/Masters"]
+}
