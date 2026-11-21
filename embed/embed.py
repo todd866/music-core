@@ -1861,7 +1861,7 @@ def build_parser() -> argparse.ArgumentParser:
     col.set_defaults(func=cmd_collect)
 
     def money(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("--cap-usd", type=float, default=float(os.environ.get("MUSIC_EMBED_CAP_USD", DEFAULT_CAP_USD)),
+        sp.add_argument("--cap-usd", type=float, default=float(os.environ.get("MUSIC_EMBED_CAP_USD") or DEFAULT_CAP_USD),
                         help="daily (UTC) embedding spend cap; default $5 or $MUSIC_EMBED_CAP_USD")
 
     def bucket(sp: argparse.ArgumentParser) -> None:

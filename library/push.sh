@@ -33,7 +33,8 @@ fail() {
 
 roots=("${(@f)$(python3 "$tool" roots 2>/dev/null)}")
 roots=(${roots:#})
-(( ${#roots} )) || { echo "music-push: no masters_roots in the config on this Mac; nothing to do" >&2; exit 0; }
+pool_mode=$(python3 "$here/pool.py" mode 2>/dev/null || echo local)
+(( ${#roots} )) || [ "$pool_mode" = "cloud" ] || { echo "music-push: no masters_roots in the config on this Mac; nothing to do" >&2; exit 0; }
 remote=$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.config/glancebar/music-library.json")))["remote"].rstrip("/"))') \
   || fail "no remote in the config"
 [ -e "$HOME/.local/state/METERED_LINK" ] && fail "metered link: not uploading"
@@ -62,6 +63,21 @@ for r in $readable; do
   disk-slot "$r" -- rclone copy "$r" "$remote" --include "*.m4a" --include "AM-MV/**.mp4" --checksum --transfers 4 \
       --log-file "$log" --log-level INFO || warnings+=("rclone copy exited $? for $r")
 done
+# 2 TB cloud pool mode: mirror both directions between R2 and cloud_remote (gdrive:MusicPool) so
+# tracks uploaded from any Mac (M5 pulls, fetch_worker, or direct Google Drive drops) stay unified.
+pool_tool="$here/pool.py"
+if [ -f "$pool_tool" ] && [ "$(python3 "$pool_tool" mode 2>/dev/null)" = "cloud" ]; then
+  cloud_remote=$(python3 "$pool_tool" cloud-remote 2>/dev/null || true)
+  if [ -n "$cloud_remote" ]; then
+    rclone copy "$cloud_remote/AM-Lossless" "$remote/AM-Lossless" --include "*.m4a" --s3-no-check-bucket \
+        --transfers 4 --checkers 8 --log-file "$log" --log-level INFO \
+        || warnings+=("cloud->r2 sync exited $?")
+    rclone copy "$remote/AM-Lossless" "$cloud_remote/AM-Lossless" --include "*.m4a" --bwlimit 4M \
+        --transfers 4 --checkers 8 --drive-stop-on-upload-limit --log-file "$log" --log-level INFO \
+        || warnings+=("r2->cloud sync exited $?")
+    python3 "$pool_tool" refresh >> "$log" 2>&1 || warnings+=("cloud pool refresh failed")
+  fi
+fi
 copied_after=$(grep -c "Copied (new)" "$log" 2>/dev/null || echo 0)
 uploaded=$((copied_after - copied_before))
 

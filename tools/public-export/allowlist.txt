@@ -7,10 +7,12 @@ store/test_musicstore.py
 store/test_facts.py
 library/musiclib.py
 library/offline_cache.py
+library/pool.py
 library/trackmeta.py
 library/push.sh
 library/README.md
 library/test_musiclib.py
+library/test_pool.py
 library/test_trackmeta.py
 embed/embed.py
 embed/nightly.sh

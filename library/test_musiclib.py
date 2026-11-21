@@ -580,6 +580,7 @@ if __name__ == '__main__':
     unittest.main()
 
 
+@unittest.skipUnless(m.rclone_bin(), 'rclone not installed')  # the CI runner has none
 class RemoteCatalogueTest(unittest.TestCase):
     """The bucket's listing is the catalogue (19 Nov 2026): masters placed straight into R2 are
     catalogued, an unreadable drive does not fail the build, and a short listing is refused."""

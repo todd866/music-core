@@ -1,0 +1,8 @@
+{
+  "mode": "cloud",
+  "cloud_remote": "gdrive:MusicPool",
+  "r2_remote": "music-bucket:music-bucket",
+  "quota_gb": 2000,
+  "hires_free_gb": 300,
+  "min_free_gb": 100
+}

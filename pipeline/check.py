@@ -147,6 +147,19 @@ def collect_m2_rows() -> list[dict]:
     else:
         rows.append(_row("mc:worker:facts", "warn", "m2 facts", "missing"))
 
+    # 5. Cloud masters pool (2 TB cloud drive stand-in for SanDisk SSD)
+    pool_cfg_p = HOME / ".config/glancebar/music-pool.json"
+    if pool_cfg_p.is_file():
+        pc = _load_json(pool_cfg_p) or {}
+        if pc.get("mode") == "cloud":
+            u = _load_json(STATE / "cloud-pool-usage.json") or {}
+            quota = float(pc.get("quota_gb", 2000))
+            used = float(u.get("used_bytes", 0)) / 1e9
+            free = max(0.0, quota - used)
+            st = "pass" if free >= 150 else ("warn" if free >= 100 else "fail")
+            rows.append(_row("mc:worker:pool", st, "2TB cloud pool", f"{free:.0f}/{quota:.0f} GB free",
+                             f"{u.get('count', 0)} files", f"{pc.get('cloud_remote')}: {free:.1f} GB free (Hi-Res {'on' if free >= float(pc.get('hires_free_gb', 300)) else 'off'})"))
+
     return rows
 
 

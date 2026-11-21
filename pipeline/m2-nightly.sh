@@ -29,7 +29,11 @@ say "step 1: push exit $push_rc"
 
 # 2. Incremental Gemini Batch embeddings (uses R2 catalogue + local venv + Gemini key)
 say "step 2: embed"
-"${ssh_local[@]}" "MUSIC_EMBED_CAP_USD='${MUSIC_EMBED_CAP_USD:-}' /bin/zsh '$root/embed/nightly.sh'" >> "$log" 2>&1
+if [ -n "${MUSIC_EMBED_CAP_USD:-}" ]; then
+  "${ssh_local[@]}" "MUSIC_EMBED_CAP_USD='$MUSIC_EMBED_CAP_USD' /bin/zsh '$root/embed/nightly.sh'" >> "$log" 2>&1
+else
+  "${ssh_local[@]}" "/bin/zsh '$root/embed/nightly.sh'" >> "$log" 2>&1
+fi
 embed_rc=$?
 say "step 2: embed exit $embed_rc"
 (( embed_rc == 0 )) || notes+=("embed exit $embed_rc")
@@ -52,7 +56,7 @@ say "step 3: mirror-vectors exit $mirror_rc"
 
 # 4. Sourced song facts (MusicBrainz year, covers, LRCLIB lyrics id, Wikipedia bio -> R2 music/facts.json)
 say "step 4: facts"
-/opt/homebrew/bin/python3 "$root/store/facts.py" >> "$HOME/.local/state/music-store/facts.out.log" 2>> "$HOME/.local/state/music-store/facts.err.log"
+/opt/homebrew/bin/python3 "$root/store/facts.py" build >> "$HOME/.local/state/music-store/facts.out.log" 2>> "$HOME/.local/state/music-store/facts.err.log"
 facts_rc=$?
 say "step 4: facts exit $facts_rc"
 (( facts_rc == 0 )) || notes+=("facts exit $facts_rc")
