@@ -20,7 +20,7 @@ GENERIC = [
     ('private-key', re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')),
     ('api-key', re.compile(r'\b(AIza[0-9A-Za-z_-]{30,}|re_[0-9A-Za-z]{20,}|sk-[0-9A-Za-z]{20,})\b')),
 ]
-ALLOWED = {'noreply@example.com', 'you@example.com'}
+ALLOWED = {'noreply@example.com', 'you@example.com', 'todd866@users.noreply.github.com'}
 
 
 def tracked():
@@ -39,7 +39,7 @@ def main():
     if out.exists():
         sys.exit(f'{out} exists')
 
-    files = [f for f in tracked() if f and any(fnmatch.fnmatch(f, p) for p in pats)]
+    files = [f for f in tracked() if f and Path(f).name != '.DS_Store' and any(fnmatch.fnmatch(f, p) for p in pats)]
     for f in files:
         dst = out / f
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -54,14 +54,18 @@ def main():
             shutil.copy2(src, dst)
 
     for f in (HERE / 'public').rglob('*'):
-        if f.is_file():
-            dst = out / f.relative_to(HERE / 'public')
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(f, dst)
+        if not f.is_file() or f.name == '.DS_Store':
+            continue
+        dst = out / f.relative_to(HERE / 'public')
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, dst)
 
     bad = []
     for f in out.rglob('*'):
         rel = str(f.relative_to(out))
+        if f.is_file() and f.name == '.DS_Store':
+            bad.append(f'{rel}: .DS_Store excluded from public export')
+            continue
         if not f.is_file() or (f.suffix not in TEXT and f.name not in ('.gitignore', 'check')):
             continue
         s = f.read_text(errors='ignore')

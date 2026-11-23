@@ -25,6 +25,11 @@ git -C "$PUBLIC_DIR" add -A
 git -C "$PUBLIC_DIR" status --short | head -60
 src="$(git -C "$ROOT" rev-parse --short HEAD)"
 [ "$mode" = --push ] || { echo "publish: staged in $PUBLIC_DIR (private $src)"; exit 0; }
-git -C "$PUBLIC_DIR" diff --cached --quiet || git -C "$PUBLIC_DIR" commit -qm "Sync from the working repository ($src)"
+if ! git -C "$PUBLIC_DIR" diff --cached --quiet; then
+  GIT_AUTHOR_NAME="todd866" GIT_AUTHOR_EMAIL="todd866@users.noreply.github.com" \
+  GIT_COMMITTER_NAME="todd866" GIT_COMMITTER_EMAIL="todd866@users.noreply.github.com" \
+    git -C "$PUBLIC_DIR" -c commit.gpgsign=false commit -qm "Sync from the working repository ($src)"
+fi
+git -C "$PUBLIC_DIR" log -1 --format='%an <%ae> / %cn <%ce>' | grep -qv gmail
 git -C "$PUBLIC_DIR" push -q origin HEAD:main
 echo "publish: pushed (private $src)"
