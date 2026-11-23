@@ -188,6 +188,23 @@ class MusicLibLogicTests(unittest.TestCase):
         self.assertEqual(len(plan2['local']), 1)
         self.assertEqual(len(plan2['toFetch']), 0)
 
+    def test_quarantined_master_is_never_wanted_until_its_sha_changes(self):
+        # A broken master (a 15 s download fragment) must not be fetched or kept wanted.
+        _, wanted, unmatched, _ = m.wanted_entries_from_requests(self.requests, self.catalogue)
+        self.assertEqual([w['catalogue']['sha256'] for w in wanted], [self.sha])
+        _, wanted, unmatched, _ = m.wanted_entries_from_requests(
+            self.requests, self.catalogue, quarantine=frozenset({self.sha}))
+        self.assertEqual(wanted, [])
+        self.assertEqual(unmatched[0]['reason'], 'no catalogue match')
+        # The list is keyed by sha, so a re-acquired master is wanted again with no config edit.
+        fixed = {'schemaVersion': 1, 'entries': [dict(self.catalogue['entries'][0], sha256='f' * 64)]}
+        _, wanted, _, _ = m.wanted_entries_from_requests(
+            self.requests, fixed, quarantine=frozenset({self.sha}))
+        self.assertEqual(len(wanted), 1)
+        cfg = dict(json.loads(self.config.read_text()), quarantine_sha256=[self.sha.upper()])
+        self.config.write_text(json.dumps(cfg))
+        self.assertEqual(m.load_config(self.config)['quarantine_sha256'], frozenset({self.sha}))
+
     def test_eviction_skips_wanted_recent_and_absent_remote(self):
         filler = 'filler/old.m4a'
         (self.hot / filler).parent.mkdir(parents=True)
@@ -216,6 +233,42 @@ class MusicLibLogicTests(unittest.TestCase):
         cat = dict(self.catalogue, entries=[big])
         plan = m.compute_plan(self.requests, cat, self.hot, {}, {}, {self.rel}, 5_000_000, 14)
         self.assertTrue(plan['overflow'])
+
+    def test_cap_pressure_evicts_younger_unwanted_lru_and_prioritizes_stations(self):
+        now = time.time()
+        f_older = 'filler/older.m4a'
+        f_newer = 'filler/newer.m4a'
+        for rel, age_days in ((f_older, 5), (f_newer, 2)):
+            p = self.hot / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(audio_bytes(rel, 'A', 'B', extra=b'x' * 600))
+            ts = now - age_days * 86400
+            os.utime(p, (ts, ts))
+        hot_map = m.hot_file_state(self.hot)
+        cap = sum(r['sizeBytes'] for r in hot_map.values())
+        # Neither filler is past keep_days=14, so with no extra_fetch_bytes nothing evicts:
+        self.assertEqual(m.plan_evictions(self.hot, hot_map, {self.rel}, {}, {}, {f_older, f_newer}, cap, 14, now, 0), [])
+        # Under cap pressure for a wanted fetch, the older unwanted R2-backed filler evicts first:
+        ev = m.plan_evictions(self.hot, hot_map, {self.rel}, {}, {}, {f_older, f_newer}, cap, 14, now, 400)
+        self.assertEqual([r['relativePath'] for r in ev], [f_older])
+        # Unbacked files are still never evicted even under cap pressure:
+        self.assertEqual(m.plan_evictions(self.hot, hot_map, {self.rel}, {}, {}, set(), cap, 14, now, 400), [])
+        # Active stations, radio likes, and kind reserves fetch ahead of song seed mixes:
+        rows = [
+            {'playlistKey': 'song:seed1'},
+            {'playlistKey': 'kind:chill'},
+            {'playlistKey': 'radio:likes'},
+            {'playlistKey': 'station:triplej'},
+            {'playlistKey': 'station:6ian'},
+        ]
+        self.assertEqual(
+            m.playlist_fetch_order(rows),
+            ['station:6ian', 'station:triplej', 'radio:likes', 'kind:chill', 'song:seed1'],
+        )
+        self.assertEqual(
+            m.playlist_fetch_order(rows, playlist_first='song:seed1')[0],
+            'song:seed1',
+        )
 
     def test_metered_guard(self):
         flag = self.root / 'metered'

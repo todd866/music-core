@@ -83,12 +83,15 @@ DEFAULTS: Dict[str, Any] = {
     ],
     "picks_min_score": 2.0,
     "picks_max": 300,
+    "glancebar_mix_dir": str(HOME / "Library/Application Support/Glancebar/mix"),
     "tv_channel_scores": "",
     "tv_src_prefix": "music",
     # Optional: the output of `ls -R <tv_music_videos>`, used instead of walking the drive
     # when it is fresh, so a busy drive does not hold the score file up.
     "tv_video_listing": "",
     "tv_video_listing_max_h": 36,
+    "music_embed_vectors": "~/.local/state/music-embed/vectors",
+    "tv_kind_picks_max": 1500,
     "check": {
         "ledger_warn_h": 30,
         "ledger_fail_h": 72,
@@ -674,6 +677,275 @@ def picks_from_scores(
     return out
 
 
+def _normalize_vec(values: List[float]) -> Optional[List[float]]:
+    import math
+    norm = math.sqrt(sum(v * v for v in values))
+    if not math.isfinite(norm) or norm <= 1e-9:
+        return None
+    inv = 1.0 / norm
+    return [v * inv for v in values]
+
+
+def build_music_space_picks_and_affinity(
+    mix_dir: Path,
+    merged: Dict[str, Dict[str, Any]],
+    max_n: int = 300,
+    vectors_dir: Optional[Path] = None,
+    kind_max_n: int = 1500,
+    include_artist_priors: bool = False,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[Tuple[str, str], float]]:
+    """Build Chill/Dance/Alt/Rap TV channel picks and per-song taste affinity from Glancebar's song map.
+
+    Owner decision (16 Nov 2026): TV music follows the listener's taste, scored by closeness to what he
+    likes on the embedding map, with Chill, Dance, Alt and Rap channels built the same way as
+    Glancebar's kinds. Also projects non-Apple-Music R2 songs from tracks.f32 onto the 4 Kind
+    centroids and emits artist-level Kind priors for music videos whose exact song isn't in R2 yet.
+    """
+    space_doc, _ = read_json_file(mix_dir / "music-space.json")
+    lib_doc, _ = read_json_file(mix_dir / "library.json")
+    if not isinstance(space_doc, dict) or not isinstance(lib_doc, dict):
+        return {}, {}
+    space_tracks = space_doc.get("tracks") or {}
+    lib_rows = lib_doc.get("tracks") if isinstance(lib_doc.get("tracks"), list) else []
+    if not isinstance(space_tracks, dict) or not space_tracks or not lib_rows:
+        return {}, {}
+
+    by_id: Dict[str, Dict[str, Any]] = {}
+    liked_ids: Set[str] = set()
+    for tr in lib_rows:
+        if not isinstance(tr, dict):
+            continue
+        tid = str(tr.get("id") or "").strip()
+        artist = str(tr.get("artist") or "").strip()
+        title = str(tr.get("title") or "").strip()
+        if not tid or not artist or not title:
+            continue
+        key = track_key(artist, title)
+        mtr = merged.get(key) or {}
+        if bool(tr.get("dislike")) or has_dislike(mtr):
+            continue
+        is_liked = bool(tr.get("fav")) or bool(tr.get("thumb")) or has_like(mtr)
+        if is_liked:
+            liked_ids.add(tid)
+        by_id[tid] = {
+            "id": tid,
+            "key": key,
+            "artist": artist,
+            "title": title,
+            "plays": int(tr.get("plays") or 0),
+            "liked": is_liked,
+        }
+
+    import math
+    import operator
+    from array import array
+
+    affinity_by_pair: Dict[Tuple[str, str], float] = {}
+    by_kind: Dict[str, List[Dict[str, Any]]] = {"chill": [], "dance": [], "alt": [], "rap": []}
+    scored_pairs: Set[Tuple[str, str]] = set()
+    pair_to_kind: Dict[Tuple[str, str], str] = {}
+    liked_pairs: Set[Tuple[str, str]] = set()
+    artist_kind_scores: Dict[str, Dict[str, List[float]]] = {}
+    artist_display: Dict[str, str] = {}
+
+    def _record_artist(artist_name: str, k_name: str, raw_score: float) -> None:
+        fold = oc.match_fold(oc.split_primary_artist(artist_name))
+        if not fold:
+            return
+        artist_display.setdefault(fold, oc.split_primary_artist(artist_name).strip() or artist_name)
+        artist_kind_scores.setdefault(fold, {}).setdefault(k_name, []).append(raw_score)
+
+    for tid, info in by_id.items():
+        sp = space_tracks.get(tid)
+        if not isinstance(sp, dict):
+            continue
+        kind = str(sp.get("kind") or "").strip().lower()
+        try:
+            kind_score = float(sp.get("kindScore") or 0.5)
+        except (TypeError, ValueError):
+            kind_score = 0.5
+        best_like_sim = 0.0
+        for nb in sp.get("next") or []:
+            if isinstance(nb, (list, tuple)) and len(nb) >= 2 and str(nb[0]) in liked_ids:
+                try:
+                    best_like_sim = max(best_like_sim, float(nb[1]))
+                except (TypeError, ValueError):
+                    pass
+        near_bonus = max(0.0, min(0.30, (best_like_sim - 0.80) * 1.5)) if best_like_sim > 0.80 else 0.0
+        like_bonus = 0.35 if info["liked"] else 0.0
+        play_bonus = min(0.15, 0.04 * math.log1p(max(0, info["plays"])))
+        taste = min(1.0, 0.35 + like_bonus + near_bonus + play_bonus)
+        pairs = _catalogue_keys(info["artist"], info["title"])
+        for pair in pairs:
+            affinity_by_pair[pair] = max(affinity_by_pair.get(pair, 0.0), taste)
+            scored_pairs.add(pair)
+            if info["liked"]:
+                liked_pairs.add(pair)
+        if kind in by_kind:
+            for pair in pairs:
+                pair_to_kind.setdefault(pair, kind)
+            raw = kind_score * 0.55 + taste * 0.45
+            why_parts = [f"map:{kind}"]
+            if info["liked"]:
+                why_parts.append("liked")
+            elif best_like_sim >= 0.84:
+                why_parts.append(f"near liked ({best_like_sim:.2f})")
+            by_kind[kind].append({
+                "key": info["key"],
+                "artist": info["artist"],
+                "title": info["title"],
+                "raw": round(raw, 6),
+                "why": " · ".join(why_parts),
+                "plays": info["plays"],
+            })
+            _record_artist(info["artist"], kind, raw)
+
+    # Expand across all embedded R2 songs in tracks.f32 using the 4 Kind centroids + liked centroid.
+    if vectors_dir is not None:
+        idx_file = vectors_dir / "tracks-index.jsonl"
+        f32_file = vectors_dir / "tracks.f32"
+        if idx_file.is_file() and f32_file.is_file():
+            try:
+                idx_rows = [json.loads(ln) for ln in idx_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                floats = array("f")
+                with f32_file.open("rb") as fh:
+                    floats.frombytes(fh.read())
+                if sys.byteorder != "little":
+                    floats.byteswap()
+                n_rows = len(idx_rows)
+                dims = (len(floats) // n_rows) if n_rows else 0
+            except (OSError, ValueError, json.JSONDecodeError):
+                idx_rows = []
+                dims = 0
+            if dims > 0 and len(floats) == len(idx_rows) * dims:
+                kind_sums: Dict[str, List[float]] = {k: [0.0] * dims for k in by_kind}
+                kind_counts: Dict[str, int] = {k: 0 for k in by_kind}
+                liked_sum = [0.0] * dims
+                liked_count = 0
+                pending_rows: List[Tuple[int, str, str, Set[Tuple[str, str]]]] = []
+                for row_i, r in enumerate(idx_rows):
+                    artist = str(r.get("artist") or "").strip()
+                    title = str(r.get("title") or "").strip()
+                    if not artist or not title:
+                        continue
+                    pairs = _catalogue_keys(artist, title)
+                    matched_kind = next((pair_to_kind[p] for p in pairs if p in pair_to_kind), "")
+                    start = row_i * dims
+                    vec = floats[start : start + dims]
+                    if matched_kind:
+                        ksum = kind_sums[matched_kind]
+                        for d_i, val in enumerate(vec):
+                            ksum[d_i] += val
+                        kind_counts[matched_kind] += 1
+                    key = track_key(artist, title)
+                    mtr = merged.get(key) or {}
+                    if (pairs & liked_pairs) or has_like(mtr):
+                        for d_i, val in enumerate(vec):
+                            liked_sum[d_i] += val
+                        liked_count += 1
+                    if not (pairs & scored_pairs) and not has_dislike(mtr):
+                        pending_rows.append((row_i, artist, title, pairs))
+
+                kind_centroids = {
+                    k: c for k, s in kind_sums.items() if kind_counts[k] > 0 and (c := _normalize_vec(s)) is not None
+                }
+                liked_centroid = _normalize_vec(liked_sum) if liked_count > 0 else None
+                if kind_centroids:
+                    for row_i, artist, title, pairs in pending_rows:
+                        if pairs & scored_pairs:
+                            continue
+                        start = row_i * dims
+                        vec = floats[start : start + dims]
+                        best_k, best_cos = max(
+                            ((k, sum(map(operator.mul, vec, c))) for k, c in kind_centroids.items()),
+                            key=lambda item: item[1],
+                        )
+                        if best_cos < 0.35:
+                            continue
+                        key = track_key(artist, title)
+                        mtr = merged.get(key) or {}
+                        is_liked = has_like(mtr)
+                        like_sim = sum(map(operator.mul, vec, liked_centroid)) if liked_centroid else 0.0
+                        kind_score = max(0.25, min(1.0, (best_cos - 0.30) / 0.45))
+                        near_bonus = max(0.0, min(0.30, (like_sim - 0.72) * 1.3)) if like_sim > 0.72 else 0.0
+                        taste = min(1.0, 0.35 + (0.35 if is_liked else 0.0) + near_bonus)
+                        raw = kind_score * 0.55 + taste * 0.45
+                        for pair in pairs:
+                            affinity_by_pair[pair] = max(affinity_by_pair.get(pair, 0.0), taste)
+                            scored_pairs.add(pair)
+                        why_parts = [f"map:{best_k}"]
+                        if is_liked:
+                            why_parts.append("liked")
+                        by_kind[best_k].append({
+                            "key": key,
+                            "artist": artist,
+                            "title": title,
+                            "raw": round(raw, 6),
+                            "why": " · ".join(why_parts),
+                            "plays": 0,
+                        })
+                        _record_artist(artist, best_k, raw)
+
+    cap_n = max(max_n, kind_max_n)
+    kind_picks: Dict[str, List[Dict[str, Any]]] = {}
+    for kind, rows in by_kind.items():
+        if not rows:
+            continue
+        rows.sort(key=lambda r: (r["raw"], r["plays"]), reverse=True)
+        trimmed = rows[:cap_n]
+        total = len(trimmed)
+        kind_picks[kind] = [
+            {
+                "key": r["key"],
+                "artist": r["artist"],
+                "title": r["title"],
+                "score": round(rank_pick_score(i, total), 6),
+                "raw": r["raw"],
+                "why": r["why"],
+                "plays": r["plays"],
+            }
+            for i, r in enumerate(trimmed)
+        ]
+
+    # Append artist-level Kind priors so music videos by embedded artists whose exact song isn't in R2 still land on their Kind channel.
+    if vectors_dir is not None or include_artist_priors:
+        for fold_art, kmap in sorted(artist_kind_scores.items()):
+            dom_kind, dom_vals = max(kmap.items(), key=lambda kv: (len(kv[1]), sum(kv[1]) / max(1, len(kv[1]))))
+            other_n = sum(len(v) for k, v in kmap.items() if k != dom_kind)
+            mean_raw = sum(dom_vals) / len(dom_vals)
+            if dom_kind in kind_picks and len(dom_vals) >= other_n and mean_raw >= 0.46:
+                kind_picks[dom_kind].append({
+                    "key": f"artist:{fold_art}",
+                    "artist": artist_display.get(fold_art, fold_art),
+                    "title": "*",
+                    "score": round(min(0.62, mean_raw * 0.62), 6),
+                    "raw": round(mean_raw, 6),
+                    "why": f"map:{dom_kind} (artist)",
+                    "plays": 0,
+                })
+    return kind_picks, affinity_by_pair
+
+
+def boost_station_picks_with_affinity(
+    picks: List[Dict[str, Any]],
+    affinity_by_pair: Dict[Tuple[str, str], float],
+) -> List[Dict[str, Any]]:
+    if not picks or not affinity_by_pair:
+        return picks
+    rescored: List[Dict[str, Any]] = []
+    for p in picks:
+        aff = max((affinity_by_pair.get(k, 0.0) for k in _catalogue_keys(p.get("artist", ""), p.get("title", ""))), default=0.0)
+        base = float(p.get("score") or 0.0)
+        # Blend station rotation rank with map taste closeness when the song is on the map:
+        blended = min(1.0, base * 0.7 + aff * 0.45) if aff > 0 else base
+        why = str(p.get("why") or "")
+        if aff >= 0.55 and "map" not in why:
+            why = f"{why} · map taste".strip(" ·")
+        rescored.append(dict(p, score=round(blended, 6), why=why))
+    rescored.sort(key=lambda r: r["score"], reverse=True)
+    return rescored
+
+
 def write_host_picks(cfg: Dict[str, Any], stations: Dict[str, List[Dict[str, Any]]]) -> None:
     if not stations:
         return
@@ -810,12 +1082,30 @@ def build_tv_channel_scores(
     matched_n: Dict[str, int] = {}
     pick_n: Dict[str, int] = {}
     video_index = index_videos_by_key(videos)
+    videos_by_artist: Dict[str, List[Tuple[str, str, str, str, str]]] = {}
+    for video in videos:
+        for raw_artist in (video[1], video[0]):
+            fold = oc.match_fold(oc.split_primary_artist(raw_artist or ""))
+            if fold:
+                videos_by_artist.setdefault(fold, []).append(video)
     for station, picks in station_picks.items():
         pick_n[station] = len(picks)
         items: Dict[str, Dict[str, Any]] = {}
         # Picks come best first; a video that matches two picks keeps the better score.
         for pick in picks:
-            for key in _catalogue_keys(pick.get("artist", ""), pick.get("title", "")):
+            p_artist = str(pick.get("artist") or "")
+            p_title = str(pick.get("title") or "")
+            if p_title == "*":
+                fold = oc.match_fold(oc.split_primary_artist(p_artist))
+                for video in videos_by_artist.get(fold, ()):
+                    src = tv_catalogue_src(prefix, video[4])
+                    if src not in items:
+                        items[src] = {
+                            "score": pick.get("score", 0.0),
+                            "why": pick.get("why") or "",
+                        }
+                continue
+            for key in _catalogue_keys(p_artist, p_title):
                 for video in video_index.get(key, ()):
                     src = tv_catalogue_src(prefix, video[4])
                     if src not in items:
@@ -1036,6 +1326,21 @@ def cmd_collect(cfg: Dict[str, Any]) -> int:
             if picks:
                 station_picks[station] = picks
                 print(f"picks {station} {len(picks)}")
+        mix_dir_s = str(cfg.get("glancebar_mix_dir") or "").strip()
+        default_share = expand(DEFAULTS["share_dir"])
+        if mix_dir_s and ("glancebar_mix_dir" in cfg or share == default_share):
+            vec_s = str(cfg.get("music_embed_vectors") or "").strip()
+            vec_dir = expand(vec_s) if vec_s and ("music_embed_vectors" in cfg or share == default_share) else None
+            kind_max = int(cfg.get("tv_kind_picks_max", 1500))
+            kind_picks, affinity = build_music_space_picks_and_affinity(
+                expand(mix_dir_s), merged, max_n, vectors_dir=vec_dir, kind_max_n=kind_max, include_artist_priors=True
+            )
+            for st_name in list(station_picks.keys()):
+                station_picks[st_name] = boost_station_picks_with_affinity(station_picks[st_name], affinity)
+            for kind_name, kpicks in kind_picks.items():
+                if kpicks and kind_name not in station_picks:
+                    station_picks[kind_name] = kpicks
+                    print(f"picks {kind_name} {len(kpicks)}")
         if station_picks:
             try:
                 write_host_picks(cfg, station_picks)
@@ -1106,6 +1411,8 @@ def export_pick_rows(
                 continue
             artist = pick.get("artist") or ""
             title = pick.get("title") or ""
+            if not title or title == "*":
+                continue
             mtr = merged.get(key) or {}
             if (mtr.get("video") or "").strip():
                 continue
@@ -1344,8 +1651,9 @@ def radio_library_row(cfg: Dict[str, Any], chk: Dict[str, Any], host: str) -> Ch
             money += f"/${float(cap):.0f}"
         parts.append(f"{money} today")
     free = lane.get("driveFreeGb") if lane else None
+    pool_label = str((lane or {}).get("poolLabel") or ("MusicPool" if isinstance(free, (int, float)) and float(free) > 1500 else "MediaDrive"))
     if isinstance(free, (int, float)):
-        parts.append(f"MediaDrive {float(free):.0f} GB free")
+        parts.append(f"{pool_label} {float(free):.0f} GB free")
     # A dated cap override (e.g. one day at $50) shows while it is on.
     cap_today = lane.get("capToday") if lane else None
     if isinstance(cap_today, (int, float)) and gaps and gaps.get("capUsd") is not None and float(cap_today) > float(gaps["capUsd"]):
@@ -1363,7 +1671,7 @@ def radio_library_row(cfg: Dict[str, Any], chk: Dict[str, Any], host: str) -> Ch
         if age_h > float(chk.get("radio_lane_warn_h", 36)):
             warns.append(f"lane {age_fact(age_h * 3600)} old" if at else "lane-status has no time")
         if isinstance(free, (int, float)) and float(free) < float(chk.get("radio_drive_warn_gb", 160)):
-            warns.append(f"MediaDrive {float(free):.0f} GB free, near the lane's 150 GB reserve")
+            warns.append(f"{pool_label} {float(free):.0f} GB free, near the lane's 150 GB reserve")
     if scout_doc is None:
         warns.append(f"scout-status: {scout_err}")
     if gaps is None:
@@ -1614,9 +1922,16 @@ def cmd_check(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
                 fact = f"ok, {age_fact(age_h * 3600)} ago"
                 if doc.get("warning"):
                     # Since 19 Nov 2026 an unreadable drive or uncatalogued objects do not fail the
-                    # push (the bucket is the catalogue's truth); they warn.
-                    st = "warn"
-                    fact += f"; {str(doc['warning'])[:160]}"
+                    # push (the bucket is the catalogue's truth); they warn — except in 2 TB cloud-pool
+                    # mode, where USB /Volumes/* roots are optional legacy inputs, not canonical masters.
+                    pool_cfg, _ = read_json_file(expand(cfg.get("music_pool_config") or "~/.config/glancebar/music-pool.json"))
+                    cloud_mode = isinstance(pool_cfg, dict) and pool_cfg.get("mode") == "cloud" and bool(pool_cfg.get("cloud_remote"))
+                    w_parts = [w.strip() for w in str(doc["warning"]).split(";") if w.strip()]
+                    if cloud_mode:
+                        w_parts = [w for w in w_parts if not w.startswith(("unreadable: /Volumes/", "not mounted: /Volumes/"))]
+                    if w_parts:
+                        st = "warn"
+                        fact += f"; {'; '.join(w_parts)[:160]}"
                 if age_h > float(chk.get("upload_fail_h", 72)):
                     st = "fail"
                 elif age_h > float(chk.get("upload_warn_h", 36)):

@@ -525,6 +525,44 @@ class SubmitCollectTests(IncrementalBase):
         # The full-run collect now refuses, since it would drop these rows.
         self.assertEqual(embed.cmd_collect(mock.Mock(state=self.state, force=False)), 1)
 
+    def test_shard_stops_at_byte_limit(self):
+        embed.init_spend(self.paths)
+        one = len(embed.encode_batch_line("new1:0", self.paths.clips / "new1" / "0.mp3"))
+        client = FakeClient()
+        with mock.patch.object(embed, "get_genai_client", return_value=client):
+            self.assertEqual(embed.cmd_inc_submit(self.args(max_bytes=one + 1)), 0)
+        jobs = embed.load_jobs(self.paths.inc_jobs)
+        self.assertEqual([j["ids"] for j in jobs], [["new1"]])  # new2 would push it over the limit
+        self.assertAlmostEqual(embed.spend_today(embed.read_spend(self.paths.spend), embed.ledger_day()), 1.0)
+        self.assertEqual([p["id"] for p in embed._prepared(self.paths)], ["new2"])
+
+    def test_rejected_upload_gives_reservation_back(self):
+        embed.init_spend(self.paths)
+        client = FakeClient()
+
+        def too_large(file, config):
+            raise RuntimeError("413 FAILED_PRECONDITION Media is too large")
+
+        client.files.upload = too_large
+        with mock.patch.object(embed, "get_genai_client", return_value=client):
+            self.assertEqual(embed.cmd_inc_submit(self.args()), 1)
+        self.assertEqual(client.created, [])
+        self.assertAlmostEqual(embed.spend_today(embed.read_spend(self.paths.spend), embed.ledger_day()), 0.0)
+        self.assertEqual(embed.inflight_ids(embed.load_jobs(self.paths.inc_jobs)), set())
+
+    def test_monthly_cap_refusal_is_a_pause_not_a_failure(self):
+        embed.init_spend(self.paths)
+        client = FakeClient()
+
+        def capped(file, config):
+            raise RuntimeError("429 RESOURCE_EXHAUSTED Your project has exceeded its monthly spending cap.")
+
+        client.files.upload = capped
+        with mock.patch.object(embed, "get_genai_client", return_value=client):
+            self.assertEqual(embed.cmd_inc_submit(self.args()), 0)
+        self.assertAlmostEqual(embed.spend_today(embed.read_spend(self.paths.spend), embed.ledger_day()), 0.0)
+        self.assertEqual([p["id"] for p in embed._prepared(self.paths)], ["new1", "new2"])
+
     def test_failed_job_releases_its_songs(self):
         embed.init_spend(self.paths)
         client = FakeClient(state="JOB_STATE_FAILED")

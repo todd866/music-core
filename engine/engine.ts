@@ -29,6 +29,7 @@ export type Pick = {
 
 const ARTIST_GAP = 8;
 const CONTROL_SHARE = 0.1;
+export const HARD_GATES = new Set(['truncated', 'quarantined']);
 
 export function isNew(t: Track, p: Profile) {
   return t.nw === 1 && !p.heard?.[t.s];
@@ -131,9 +132,10 @@ export function buildQueue(req: QueueReq, profile: Profile, now = new Date(), se
   if (req.start && S.bySha.has(req.start)) {
     let i = S.bySha.get(req.start)!;
     let why = 'you asked for it';
-    if (req.playable && !req.playable.has(S.tracks[i].s)) {
-      // Not streamable on this device yet: its nearest neighbour that is.
-      const nb = S.tracks[i].n.find(([j]) => req.playable!.has(S.tracks[j].s));
+    const hardBlocked = (idx: number) => Boolean(S.tracks[idx].gx && HARD_GATES.has(S.tracks[idx].gx));
+    if (hardBlocked(i) || (req.playable && !req.playable.has(S.tracks[i].s))) {
+      // Truncated/quarantined or not streamable on this device yet: its nearest neighbour that is.
+      const nb = S.tracks[i].n.find(([j]) => !hardBlocked(j) && (!req.playable || req.playable.has(S.tracks[j].s)));
       if (nb) { why = `closest playable here to ${S.tracks[i].t}`; i = nb[0]; } else i = -1;
     }
     const t = S.tracks[i];
@@ -150,7 +152,7 @@ export function buildQueue(req: QueueReq, profile: Profile, now = new Date(), se
       const t = S.tracks[i];
       if (used.has(i) || hardSkips.has(t.s)) return false;
       if (!relaxed && recentIx.has(i)) return false;
-      if (t.gx && !likedSet.has(t.s)) return false; // quality gate, unless this listener liked it
+      if (t.gx && (HARD_GATES.has(t.gx) || !likedSet.has(t.s))) return false; // quality gate; corrupt/truncated files never bypass even when liked
       if (earlyRegion.has(t.c) && slot < 3) return false; // two early skips here: leave the region
       if (req.playable && !req.playable.has(t.s)) return false;
       if (!relaxed && recentArtists.slice(-ARTIST_GAP).includes(primaryArtist(t.a))) return false;

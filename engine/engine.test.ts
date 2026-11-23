@@ -70,3 +70,16 @@ test('playable filter: with everything unplayable, nothing is picked', () => {
   assert.ok(picks.every((p) => p.s === 'sha1' || p.s === undefined));
   assert.ok(picks.length <= 1);
 });
+
+test('hard gate: truncated tracks are never picked even when liked or requested as start', () => {
+  const dir = fixtureDir();
+  const raw = JSON.parse(fs.readFileSync(path.join(dir, 'space.json'), 'utf8'));
+  // sha2 is in profile.likes; mark it truncated and give itgl=1
+  const t2 = raw.tracks.find((t: { s: string }) => t.s === 'sha2');
+  t2.gx = 'truncated';
+  t2.gl = 1;
+  fs.writeFileSync(path.join(dir, 'space.json'), JSON.stringify(raw));
+  space({ dir });
+  const { picks } = buildQueue({ mood: 'chill', n: 6, start: 'sha2' }, profile, new Date('2026-11-20T02:00:00Z'), 42);
+  assert.ok(!picks.some((p) => p.s === 'sha2'), 'truncated liked track must never be served');
+});

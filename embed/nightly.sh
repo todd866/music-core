@@ -52,10 +52,15 @@ else
     GEMINI_API_KEY=$(sed -n 's/^GEMINI_API_KEY=//p' "$keyfile" | head -1 | tr -d '"'"'"' \r')
     export GEMINI_API_KEY
   fi
-  # Honour dated per-day cap override (~/.config/glancebar/embed-cap-override.json, Perth date, same as fetch_worker.py)
+  # Honour dated per-day cap override (~/.config/glancebar/embed-cap-override.json, Perth date, same as fetch_worker.py),
+  # else ask the holistic $100/month allocator (budget.py) so backlogs clear fast while staying <= $96.50/mo.
   if [ -z "${MUSIC_EMBED_CAP_USD:-}" ] && [ -r "$HOME/.config/glancebar/embed-cap-override.json" ]; then
     ov=$("$py" -c 'import json,time,os; o=json.load(open(os.path.expanduser("~/.config/glancebar/embed-cap-override.json"))); print(o["usd"] if o.get("perth_date")==time.strftime("%Y-%m-%d",time.gmtime(time.time()+8*3600)) else "")' 2>/dev/null || true)
     [ -n "$ov" ] && export MUSIC_EMBED_CAP_USD="$ov" && say "cap override active: \$$ov"
+  fi
+  if [ -z "${MUSIC_EMBED_CAP_USD:-}" ] && [ -f "${0:A:h}/budget.py" ]; then
+    hol=$("$py" "${0:A:h}/budget.py" cap --lane music 2>/dev/null || true)
+    [ -n "$hol" ] && export MUSIC_EMBED_CAP_USD="$hol" && say "holistic budget cap (music): \$$hol"
   fi
   if [ -z "${GEMINI_API_KEY:-}" ]; then
     say "FAIL no GEMINI_API_KEY in $keyfile"
@@ -63,13 +68,43 @@ else
   else
     run collect "$py" -W ignore "$tool" increment collect
     run prepare env HEAVY_SLOT_LOCAL=1 heavy-slot -- "$py" -W ignore "$tool" increment prepare
-    run submit "$py" -W ignore "$tool" increment submit
+    # Spend hold (the owner, 21 Nov 2026): Gemini bills the same Google Cloud credit, which must last until
+    # next month's AI Pro credit. While ~/.config/fleet/gcp-spend-hold exists, songs are prepared but not sent.
+    if [ -f "$HOME/.config/fleet/gcp-spend-hold" ]; then
+      say "submit: skipped, Google Cloud spend hold is on"
+    else
+      run submit "$py" -W ignore "$tool" increment submit
+    fi
     run wait "$py" -W ignore "$tool" increment wait --timeout 7200 --interval 60
   fi
 fi
 run spend "$py" "$tool" spend
+[ -f "${0:A:h}/budget.py" ] && run budget "$py" "${0:A:h}/budget.py" status
 if (( ${#failed} )); then status false "${(j:; :)failed}"; else status true ok; fi
 run gaps "$py" "$tool" gaps --upload
+# Second map, local and free (decided 21 Nov 2026): EmbeddingGemma 2 on the same clips, kept
+# beside the Gemini map in vectors-gemma/. Bounded slice; skipped quietly until its venv exists.
+gemma_py="$HOME/.local/state/music-gemma/venv/bin/python"
+if [ -x "$gemma_py" ]; then
+  run gemma-build env HEAVY_SLOT_LOCAL=1 heavy-slot -- "$gemma_py" "${0:A:h}/gemma_map.py" build --max-minutes 45
+  run gemma-compare "$gemma_py" "${0:A:h}/gemma_map.py" compare
+fi
+# Relation map: ridge 768->3072, similarity calibration, neighbour agreement.
+# Written under vectors/relation/. Never touches vectors/tracks.f32. Numpy only.
+rel_py=""
+for cand in "$gemma_py" "$py"; do
+  [ -x "$cand" ] || continue
+  if "$cand" -c 'import numpy' >/dev/null 2>&1; then
+    rel_py="$cand"
+    break
+  fi
+done
+if [ -n "$rel_py" ]; then
+  run relate env HEAVY_SLOT_LOCAL=1 heavy-slot -- "$rel_py" -W ignore "$tool" increment relate --max-minutes 10
+else
+  say "relate: no python with numpy"
+  failed+=("relate no numpy")
+fi
 (( ${#failed} )) && status false "${(j:; :)failed}"
 say "nightly end: ${#failed} problems"
 (( ${#failed} == 0 ))

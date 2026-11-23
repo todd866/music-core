@@ -44,16 +44,26 @@ say "push start: ${#roots} roots"
 # not mistaken for a missing grant. An unreadable root is skipped, not fatal.
 readable=() warnings=()
 for r in $roots; do
-  if [ ! -d "$r" ]; then warnings+=("not mounted: $r"); continue; fi
+  if [ ! -d "$r" ]; then
+    [ "$pool_mode" = "cloud" ] || warnings+=("not mounted: $r")
+    continue
+  fi
   ok=0
-  for attempt in 1 2; do
-    # Bounded wait for the disk: with the TV in use (disk-slot priority) or another job on it, the
-    # root is skipped tonight and the bucket plus the previous catalogue stand in for it.
-    err=$(disk-slot --wait 1200 "$r" -- gtimeout 60 ls "$r" 2>&1 >/dev/null) && { ok=1; break; }
-    say "probe $attempt failed on $r: $(print -r -- "$err" | tail -1 | cut -c1-160)"
-    command sleep 5
-  done
-  (( ok )) && readable+=("$r") || warnings+=("unreadable: $r")
+  if [ "$pool_mode" = "cloud" ]; then
+    # In 2 TB cloud-pool mode (gdrive:MusicPool + R2), local USB drives are optional legacy sources:
+    # harvest them only if immediately free, never waiting 20 min behind TV/backup locks or warning.
+    disk-slot --nowait "$r" -- gtimeout 30 ls "$r" >/dev/null 2>&1 && ok=1
+    (( ok )) && readable+=("$r")
+  else
+    for attempt in 1 2; do
+      # Bounded wait for the disk: with the TV in use (disk-slot priority) or another job on it, the
+      # root is skipped tonight and the bucket plus the previous catalogue stand in for it.
+      err=$(disk-slot --wait 1200 "$r" -- gtimeout 60 ls "$r" 2>&1 >/dev/null) && { ok=1; break; }
+      say "probe $attempt failed on $r: $(print -r -- "$err" | tail -1 | cut -c1-160)"
+      command sleep 5
+    done
+    (( ok )) && readable+=("$r") || warnings+=("unreadable: $r")
+  fi
 done
 
 copied_before=$(grep -c "Copied (new)" "$log" 2>/dev/null || echo 0)
@@ -104,15 +114,17 @@ fi
 cat "$out" >> "$log"
 
 remote_n=$(rclone lsf -R --files-only --fast-list --include "*.m4a" "$remote/AM-Lossless" | wc -l | tr -d ' ')
-python3 - "$out" "$state/push-status.json" "$hist" "$uploaded" "$remote_n" "$(stamp)" "$(date +%s)" "${(j:; :)warnings}" <<'EOF'
+python3 - "$out" "$state/push-status.json" "$hist" "$uploaded" "$remote_n" "$(stamp)" "$(date +%s)" "${(j:; :)warnings}" "$pool_mode" <<'EOF'
 import json, os, sys
-out, status, hist, uploaded, remote_n, at, epoch, warn = sys.argv[1:9]
+out, status, hist, uploaded, remote_n, at, epoch, warn, pool_mode = sys.argv[1:10]
 rep = json.load(open(out)).get("report") or {}
 doc = {"ok": True, "at": at, "epoch": int(epoch), "masters": rep.get("entries"), "remote": int(remote_n),
        "uploaded": int(uploaded), "catalogue": rep.get("entries"), "fromDrive": rep.get("drive"),
        "carried": rep.get("carried"), "fetched": rep.get("fetched"), "pending": rep.get("pending"),
        "ids": rep.get("ids")}
-warnings = [w for w in warn.split("; ") if w] + [f"unreadable: {r}" for r in rep.get("unreadableRoots") or []]
+warnings = [w for w in warn.split("; ") if w]
+if pool_mode != "cloud":
+    warnings += [f"unreadable: {r}" for r in rep.get("unreadableRoots") or []]
 if rep.get("pending"):
     warnings.append(f"{rep['pending']} objects in the bucket not yet catalogued (fetch cap or metered)")
 if warnings:

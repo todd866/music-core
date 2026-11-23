@@ -209,6 +209,26 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(sent[0][0], 'copyto')
         self.assertTrue(sent[0][2].startswith('r:bucket/music/taste/ian/snapshot.json'))
 
+    def test_supersedes_upgrades_aliases_and_snapshot_events(self):
+        new_sha = 'c' * 64
+        prev = {'apple': {'999': A}, 'how': {'apple': {'999': 'sha'}}}
+        entries = [{'sha256': new_sha, 'relativePath': 'AM-Lossless/Art/Alb/01. Song.m4a',
+                    'tags': {'artist': 'Art', 'title': 'Song'}, 'mtimeNs': 1}]
+        claims = [{'kind': 'supersedes', 'id': A, 'sha': new_sha, 'relativePath': 'AM-Lossless/Art/Alb/01. Song.m4a'}]
+        doc = ms.build_ids(entries, claims, previous=prev)
+        self.assertEqual(doc['supersedes'][A], new_sha)
+        self.assertEqual(doc['apple']['999'], new_sha)
+        self.assertEqual(ms.Ids(doc).resolve(sha=A), (new_sha, 'supersedes'))
+
+        evs = [
+            ms.make_event('ian', '6ian', 'like', sha=A, at='2026-11-17T01:00:00Z', host='m5'),
+            ms.make_event('ian', '6ian', 'play', sha=A, at='2026-11-17T01:05:00Z', host='m5'),
+        ]
+        snap = ms.build_snapshot('ian', evs, supersedes=doc['supersedes'], now='2026-11-20T00:00:00Z')
+        self.assertEqual(snap['likes'], [new_sha])
+        self.assertIn(new_sha, snap['heard'])
+        self.assertNotIn(A, snap['likes'])
+
 
 if __name__ == '__main__':
     unittest.main()

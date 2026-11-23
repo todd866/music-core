@@ -272,10 +272,10 @@ def _playback_track_key(row: dict) -> str | None:
 
 
 def _scout_acquired_index(ledger: Path) -> dict[str, dict]:
-    """Scout-published tracks: key → latest acquired row."""
+    """Scout-published tracks: key → latest acquired or lane-handed row."""
     index: dict[str, dict] = {}
     for row in read_jsonl_rows(ledger):
-        if row.get("action") != "acquired":
+        if row.get("action") not in ("acquired", "lane"):
             continue
         key = row.get("track_key") or track_key(row.get("artist", ""), row.get("title", ""))
         index[key] = row
@@ -364,6 +364,54 @@ def skip_rejected_keys(cfg: dict[str, Any], paths: ScoutPaths) -> set[str]:
         started = float(epoch)
 
     return {key for key, days in skip_days.items() if len(days) >= reject_n and key not in completed}
+
+
+def playback_artist_reception(cfg: dict[str, Any]) -> dict[str, float]:
+    """Per-artist playback reception delta in [-0.25, +0.20] from Glancebar playback.jsonl.
+
+    Uses the same clock-gap discipline as `skip_rejected_keys`: an `auto-advance` or `crossfade`
+    counts as a completion of the outgoing track, while a `click-next` within 45 s counts as an
+    early skip. Artists with >= 2 observed plays nudge candidate ranking up or down.
+    """
+    rows = _playback_log_rows(Path(cfg["playback_log"]).expanduser())
+    if not rows:
+        return {}
+    completions: Counter[str] = Counter()
+    early_skips: Counter[str] = Counter()
+    current_artist: str | None = None
+    started = 0.0
+    for row in rows:
+        event = str(row.get("event") or "")
+        if event == "launch":
+            current_artist = None
+            continue
+        if event != "track":
+            continue
+        epoch = row.get("epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+            current_artist = None
+            continue
+        cause = str(row.get("cause") or "")
+        if current_artist:
+            gap = float(epoch) - started
+            if cause in ("auto-advance", "crossfade"):
+                completions[current_artist] += 1
+            elif cause == "click-next" and 0 <= gap < 45.0:
+                early_skips[current_artist] += 1
+        key = _playback_track_key(row)
+        raw_artist = (row.get("artist") or (key.split("|", 1)[0] if key and "|" in key else "")).strip()
+        current_artist = primary_artist_name(raw_artist) if raw_artist else None
+        started = float(epoch)
+
+    reception: dict[str, float] = {}
+    for art in set(completions) | set(early_skips):
+        c_n = completions[art]
+        s_n = early_skips[art]
+        if c_n + s_n < 2:
+            continue
+        ratio = (c_n + 1.0) / (c_n + s_n + 2.0)
+        reception[art] = round(max(-0.25, min(0.20, (ratio - 0.5) * 0.5)), 4)
+    return reception
 
 
 def rejected_keys(cfg: dict[str, Any], paths: ScoutPaths) -> set[str]:
@@ -633,12 +681,13 @@ def rclone_publisher(cfg: dict[str, Any]) -> Callable[[Path], str | None]:
 ENGINE_COMMANDS = {
     # Each takes the prompt on stdin and prints the model's reply. All read-only, no tools.
     "zai": ["glm-opinion", "--timeout", "300"],
-    "codex": ["codex", "exec", "-s", "read-only"],
-    "claude": [str(Path.home() / ".local/bin/claude"), "-p", "--tools", "", "--model", "haiku"],
+    "gemini": ["agy-opinion", "--timeout", "540"],
     # cursor-opinion gives up after 300 s by default, and the taste prompt has run past that
     # (13 Nov: the scheduled run recorded exit 124 and acquired on the other sources only).
     # It gets 540 s here, inside this tool's own 600 s limit.
     "cursor": ["cursor-opinion", "--timeout", "540"],
+    "codex": ["codex", "exec", "-s", "read-only"],
+    "claude": [str(Path.home() / ".local/bin/claude"), "-p", "--tools", "", "--model", "haiku"],
 }
 
 
@@ -662,36 +711,63 @@ def _tool_env() -> dict[str, str]:
     return env
 
 
+PAUSED_PROVIDERS_PATH = Path.home() / ".config/agentkit/paused-providers"
+
+
+def _paused_engines(path: Path = PAUSED_PROVIDERS_PATH) -> set[str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    return {ln.strip().lower() for ln in lines if ln.strip() and not ln.strip().startswith("#")}
+
+
 def _default_ai_pick(prompt: str, cmd: str) -> tuple[int, str]:
-    """Ask whichever engine has capacity. `ai-pick` only NAMES the engine (exit 75 = defer);
-    the prompt is then run through that engine's own read-only command. Only ai-pick's own
-    exit 75 is a deferral: a command that cannot be found or run is an error with its reason."""
+    """Ask whichever active engine has capacity. `ai-pick` only NAMES the engine (exit 75 = defer);
+    the prompt is then run through that engine's own read-only command. Paused providers
+    (~/.config/agentkit/paused-providers) are excluded upfront, and if one engine fails at runtime
+    (e.g. account hold / quota), remaining eligible engines are tried before failing."""
     env = _tool_env()
     pick_exe = shutil.which(cmd, path=env["PATH"])
     if not pick_exe:
         return 127, f"{cmd} not found on PATH ({env['PATH']})"
-    try:
-        pick = subprocess.run([pick_exe, "--engines", ",".join(ENGINE_COMMANDS), "--min", "20"],
-                              capture_output=True, text=True, timeout=60, env=env)
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        return 1, f"{cmd}: {exc}"
-    if pick.returncode != 0:
-        return pick.returncode, (pick.stderr or pick.stdout or "").strip()[-400:]
-    engine = (pick.stdout or "").strip().splitlines()[-1].strip() if (pick.stdout or "").strip() else ""
-    argv = ENGINE_COMMANDS.get(engine)
-    if not argv:
-        return 1, f"{cmd} named an engine this tool cannot run: {engine!r}"
-    exe = shutil.which(argv[0], path=env["PATH"])
-    if not exe:
-        return 127, f"{engine}: {argv[0]} not found on PATH"
-    try:
-        proc = subprocess.run([exe, *argv[1:]], input=prompt, capture_output=True, text=True, timeout=600,
-                              cwd=str(Path(__file__).resolve().parent), env=env)
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        return 1, f"{engine}: {exc}"
-    if proc.returncode != 0:
-        return proc.returncode, f"{engine}: {(proc.stderr or proc.stdout or '')[-400:]}"
-    return 0, proc.stdout or ""
+    paused = _paused_engines()
+    candidates = [e for e in ENGINE_COMMANDS if e not in paused]
+    if not candidates:
+        return 75, "all configured engines are paused"
+
+    tried: list[str] = []
+    last_err = (1, "no engine succeeded")
+    while True:
+        remaining = [e for e in candidates if e not in tried]
+        if not remaining:
+            return last_err
+        try:
+            pick = subprocess.run([pick_exe, "--engines", ",".join(remaining), "--min", "20"],
+                                  capture_output=True, text=True, timeout=60, env=env)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return 1, f"{cmd}: {exc}"
+        if pick.returncode != 0:
+            return (pick.returncode, (pick.stderr or pick.stdout or "").strip()[-400:]) if not tried else last_err
+        engine = (pick.stdout or "").strip().splitlines()[-1].strip() if (pick.stdout or "").strip() else ""
+        argv = ENGINE_COMMANDS.get(engine)
+        if not argv:
+            return 1, f"{cmd} named an engine this tool cannot run: {engine!r}"
+        tried.append(engine)
+        exe = shutil.which(argv[0], path=env["PATH"])
+        if not exe:
+            last_err = (127, f"{engine}: {argv[0]} not found on PATH")
+            continue
+        try:
+            proc = subprocess.run([exe, *argv[1:]], input=prompt, capture_output=True, text=True, timeout=600,
+                                  cwd=str(Path(__file__).resolve().parent), env=env)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            last_err = (1, f"{engine}: {exc}")
+            continue
+        if proc.returncode != 0:
+            last_err = (proc.returncode, f"{engine}: {(proc.stderr or proc.stdout or '')[-400:]}")
+            continue
+        return 0, proc.stdout or ""
 
 
 def _default_run_amdl(url: str) -> tuple:
@@ -1908,6 +1984,7 @@ def score_candidate(
     ever_hearted: set[str] | None = None,
     current_hearts: set[str] | None = None,
     media_likes: set[str] | None = None,
+    artist_reception: dict[str, float] | None = None,
 ) -> float:
     base = float(c.get("score_hint") or 0.5)
     key = track_key(c.get("artist", ""), c.get("title", ""))
@@ -1929,6 +2006,9 @@ def score_candidate(
     art = normal(c.get("artist", ""))
     if artist_affinity.get(art, 0) > 0:
         base += 0.15
+    if artist_reception:
+        prim = primary_artist_name(c.get("artist", ""))
+        base += float(artist_reception.get(prim, artist_reception.get(art, 0.0)))
     return base
 
 
@@ -1950,6 +2030,7 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
     artist_affinity = Counter()
     for a in liked_artists(cfg):
         artist_affinity[a] += 1
+    reception = playback_artist_reception(cfg)
     universe, _ = load_universe(Path(cfg["media_share"]).expanduser())
     media_likes = media_like_keys(universe)
     skip_rejected = skip_rejected_keys(cfg, paths)
@@ -1995,6 +2076,7 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
             ever_hearted=ever_hearted,
             current_hearts=hearts,
             media_likes=media_likes,
+            artist_reception=reception,
         )
         scored["track_key"] = key
         # A retry was already chosen once (it is last night's pick that failed to download), so
@@ -2386,36 +2468,214 @@ def cmd_acquire(
     return summary
 
 
+def heard_through_keys(cfg: dict[str, Any], candidates: dict[str, dict]) -> set[str]:
+    """Durable evidence from playback.jsonl that a candidate actually got a fair listen.
+
+    Being offered in new-music.json is not evidence of listening (owner policy, 17 Nov 2026).
+    A track counts as heard when it reached an auto-advance/crossfade, logged an elapsed
+    position >= 50% of its duration (90 s when unknown), or had >= 2 listens of >= 30 s.
+    """
+    if not candidates:
+        return set()
+    rows = _playback_log_rows(Path(cfg["playback_log"]).expanduser())
+    if not rows:
+        return set()
+    basename_to_key: dict[str, str] = {}
+    norm_to_key: dict[str, str] = {}
+    for key, row in candidates.items():
+        norm_to_key[normal(key)] = key
+        for field in ("local_path", "catalogue_relative_path"):
+            base = _path_basename(row.get(field))
+            if base:
+                basename_to_key.setdefault(base, key)
+
+    def match_row(row: dict) -> str | None:
+        base = str(row.get("file") or "")
+        if base and base in basename_to_key:
+            return basename_to_key[base]
+        rk = _playback_track_key(row)
+        if rk:
+            if rk in candidates:
+                return rk
+            nk = norm_to_key.get(normal(rk))
+            if nk:
+                return nk
+        return None
+
+    def half_for(key: str) -> float:
+        try:
+            dur = float(candidates[key].get("duration_seconds") or 0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        return 0.5 * dur if dur > 0 else 90.0
+
+    heard: set[str] = set()
+    substantial_plays: Counter = Counter()
+    current: str | None = None
+    started = 0.0
+    for row in rows:
+        event = str(row.get("event") or "")
+        if event == "launch":
+            current = None
+            continue
+        mk = match_row(row)
+        elapsed = row.get("elapsed")
+        if mk and isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+            if float(elapsed) >= half_for(mk):
+                heard.add(mk)
+        if event != "track":
+            continue
+        epoch = row.get("epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+            current = None
+            continue
+        cause = str(row.get("cause") or "")
+        if current is not None:
+            gap = float(epoch) - started
+            if cause in ("auto-advance", "crossfade"):
+                heard.add(current)
+            elif gap >= half_for(current):
+                heard.add(current)
+            elif gap >= 30.0:
+                substantial_plays[current] += 1
+                if substantial_plays[current] >= 2:
+                    heard.add(current)
+        current = mk
+        started = float(epoch)
+    return heard
+
+
+def _retention_days_for_row(
+    row: dict[str, Any],
+    offered_meta: dict[str, Any],
+    *,
+    is_heard: bool,
+    fresh_days: int,
+    cfg: dict[str, Any],
+) -> int:
+    """Promise-sensitive retention window (owner policy, 17 Nov 2026)."""
+    if is_heard:
+        return fresh_days
+    source = str(row.get("source") or offered_meta.get("source") or "")
+    why = str(row.get("why") or offered_meta.get("why") or "")
+    why_l = why.lower()
+    if source in ("shazam", "tv-like") or "shazamed" in why_l or "liked on the tv" in why_l:
+        return int(cfg.get("high_promise_unheard_days", max(fresh_days * 4, 60)))
+    heard_stations = row.get("heard") or offered_meta.get("heard") or {}
+    station_count = len(heard_stations) if isinstance(heard_stations, dict) else 0
+    try:
+        score = float(row.get("score") or offered_meta.get("score") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    multi_radio = source.startswith("radio:") and (station_count >= 2 or " and " in why_l)
+    if multi_radio or station_count >= 2 or score >= 0.72:
+        return int(cfg.get("strong_promise_unheard_days", max(fresh_days * 3, 42)))
+    return fresh_days
+
+
+def _load_catalogue_binder(cfg: dict[str, Any]):
+    """Return a function (artist, title) -> catalogue entry dict | None from music_library_state."""
+    cat_path = Path(cfg["music_library_state"]).expanduser() / "catalogue.json"
+    if not cat_path.is_file():
+        return lambda _a, _t: None
+    try:
+        lib_dir = Path(__file__).resolve().parent.parent / "library"
+        if not (lib_dir / "musiclib.py").is_file():
+            lib_dir = Path(__file__).resolve().parent.parent / "music-library"
+        if str(lib_dir) not in sys.path:
+            sys.path.insert(0, str(lib_dir))
+        import musiclib as ml
+        catalogue = json.loads(cat_path.read_text(encoding="utf-8"))
+        quarantine: frozenset[str] = frozenset()
+        ml_cfg_path = HOME / ".config/glancebar/music-library.json"
+        if ml_cfg_path.is_file():
+            try:
+                quarantine = ml.load_config(ml_cfg_path).get("quarantine_sha256", frozenset())
+            except Exception:
+                quarantine = frozenset()
+        entries = ml.index_catalogue(catalogue, quarantine=quarantine)
+        if not entries:
+            return lambda _a, _t: None
+
+        def bind(artist: str, title: str) -> dict | None:
+            hits, _ = ml.match_track({"artist": artist, "title": title}, entries)
+            return hits[0] if len(hits) == 1 else None
+
+        return bind
+    except Exception:
+        return lambda _a, _t: None
+
+
 def cmd_publish(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> dict[str, Any]:
     fresh_days = int(cfg["fresh_days"])
-    cutoff = utc_now() - timedelta(days=fresh_days)
+    now = parse_iso(runners.clock()) or utc_now()
     hearts = load_hearts(Path(cfg["hearts_path"]).expanduser())
     rejected = rejected_keys(cfg, paths)
-    tracks: list[dict] = []
     ledger_rows = read_jsonl_rows(paths.ledger)
-    # Why it was picked ("Shazamed 14 Nov") is said when it is offered. Rows acquired before
-    # the reason was copied onto the acquired row take it from their latest offer.
-    offered_why: dict[str, str] = {}
+    # Why/source/score/heard may live on the offered/queued row before acquisition.
+    offered_meta: dict[str, dict[str, Any]] = {}
     for row in ledger_rows:
-        if row.get("action") in ("offered", "queued") and row.get("why"):
+        if row.get("action") in ("offered", "queued"):
             key = row.get("track_key") or track_key(row.get("artist", ""), row.get("title", ""))
-            offered_why[key] = row["why"]
+            prev = dict(offered_meta.get(key) or {})
+            for field in ("why", "source", "score", "heard", "era"):
+                if row.get(field) is not None and row.get(field) != "":
+                    prev[field] = row[field]
+            offered_meta[key] = prev
+
+    bind_catalogue = _load_catalogue_binder(cfg)
+    by_key: dict[str, dict[str, Any]] = {}
     for row in ledger_rows:
-        if row.get("action") != "acquired":
-            continue
-        at = parse_iso(row.get("at") or "")
-        if not at or at < cutoff:
+        action = row.get("action")
+        if action not in ("acquired", "lane"):
             continue
         key = row.get("track_key") or track_key(row.get("artist", ""), row.get("title", ""))
+        meta = offered_meta.get(key) or {}
+        era = str(row.get("era") or meta.get("era") or "")
+        src = str(row.get("source") or meta.get("source") or "")
+        # Back-catalogue canon picks belong in the library and kind mixes, not "New music".
+        if era == "back" or src.startswith("back:"):
+            continue
         if key in rejected or normal(key) in hearts:
             continue
-        item = {
+        at = parse_iso(row.get("at") or "")
+        if not at:
+            continue
+        merged = dict(row)
+        if not merged.get("catalogue_relative_path") or not merged.get("sha256"):
+            hit = bind_catalogue(merged.get("artist") or "", merged.get("title") or "")
+            if hit:
+                merged["catalogue_relative_path"] = hit.get("relativePath")
+                merged["sha256"] = hit.get("sha256")
+                tags = hit.get("tags") or {}
+                if not merged.get("album") and tags.get("album"):
+                    merged["album"] = tags["album"]
+                if not merged.get("duration_seconds") and hit.get("durationSeconds"):
+                    merged["duration_seconds"] = hit["durationSeconds"]
+            elif action == "lane":
+                # Handed to the home worker lane, not yet in catalogue.json: wait until playable.
+                continue
+        by_key[key] = merged
+
+    heard_keys = heard_through_keys(cfg, by_key)
+    tracks: list[dict] = []
+    for key, row in by_key.items():
+        at = parse_iso(row.get("at") or "")
+        if not at:
+            continue
+        meta = offered_meta.get(key) or {}
+        keep_days = _retention_days_for_row(
+            row, meta, is_heard=(key in heard_keys), fresh_days=fresh_days, cfg=cfg
+        )
+        if at < now - timedelta(days=keep_days):
+            continue
+        item: dict[str, Any] = {
             "track_key": key,
             "artist": row.get("artist") or "",
             "title": row.get("title") or "",
             "album": row.get("album") or "",
             "duration_seconds": row.get("duration_seconds"),
-            "why": row.get("why") or offered_why.get(key) or "new acquisition",
+            "why": row.get("why") or meta.get("why") or "new acquisition",
             "acquired_at": row.get("at"),
         }
         if row.get("local_path"):
@@ -2424,8 +2684,9 @@ def cmd_publish(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> dic
             item["catalogue_relative_path"] = row["catalogue_relative_path"]
         if row.get("sha256"):
             item["sha256"] = row["sha256"]
-        if row.get("heard"):
-            item["heard"] = row["heard"]  # stations and dates, for "heard on KEXP"
+        heard_val = row.get("heard") or meta.get("heard")
+        if heard_val:
+            item["heard"] = heard_val  # stations and dates, for "heard on KEXP"
         tracks.append(item)
     tracks.sort(key=lambda r: r.get("acquired_at") or "", reverse=True)
     doc = {

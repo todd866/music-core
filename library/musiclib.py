@@ -80,6 +80,9 @@ def load_config(path=None):
         'alias_inputs': [str(Path(a).expanduser()) for a in
                          raw.get('alias_inputs') or [str(DEFAULT_STATE / 'alias-inputs' / '*.jsonl')]],
         'catalogue_fetch_max': int(raw.get('catalogue_fetch_max', 200)),
+        # Masters known to be broken (e.g. a 15 s download fragment): never wanted, never fetched.
+        # Keyed by sha256, so a re-acquired master (new sha) is playable again without editing this.
+        'quarantine_sha256': frozenset(str(s).lower() for s in raw.get('quarantine_sha256') or []),
         'config_path': p,
     }
 
@@ -674,9 +677,10 @@ def inside(root, rel):
     return dest if root in dest.parents else None
 
 
-def index_catalogue(catalogue):
+def index_catalogue(catalogue, quarantine=()):
     return [entry for entry in (catalogue.get('entries') or [])
-            if isinstance(entry, dict) and safe_relpath(entry.get('relativePath'))]
+            if isinstance(entry, dict) and safe_relpath(entry.get('relativePath'))
+            and str(entry.get('sha256') or '').lower() not in quarantine]
 
 
 def hot_file_state(hot_dir):
@@ -751,8 +755,8 @@ def merge_extra_requests(requests_doc, extra_path=None):
     return merged
 
 
-def wanted_entries_from_requests(requests_doc, catalogue, max_tracks=120):
-    entries = index_catalogue(catalogue)
+def wanted_entries_from_requests(requests_doc, catalogue, max_tracks=120, quarantine=()):
+    entries = index_catalogue(catalogue, quarantine)
     playlists = []
     library_playlists = []
     unmatched = []
@@ -788,6 +792,20 @@ def wanted_entries_from_requests(requests_doc, catalogue, max_tracks=120):
     return playlists, list(wanted_by_rel.values()), unmatched, library_playlists
 
 
+def _playlist_priority_tier(key, playlist_first=None):
+    if playlist_first and key == playlist_first:
+        return 0
+    if key == 'station:6ian':
+        return 1
+    if key.startswith('station:'):
+        return 2
+    if key == 'radio:likes' or key.startswith('radio:'):
+        return 3
+    if key.startswith('kind:') or key.startswith('reserve:'):
+        return 4
+    return 5
+
+
 def playlist_fetch_order(to_fetch, playlist_first=None):
     order = []
     seen = set()
@@ -799,7 +817,9 @@ def playlist_fetch_order(to_fetch, playlist_first=None):
         if key and key not in seen:
             order.append(key)
             seen.add(key)
-    return order
+    indexed = list(enumerate(order))
+    indexed.sort(key=lambda pair: (_playlist_priority_tier(pair[1], playlist_first), pair[0]))
+    return [key for _, key in indexed]
 
 
 def group_to_fetch_by_playlist(to_fetch):
@@ -904,12 +924,12 @@ def reconcile_wanted_hot(hot_dir, wanted_entries, verified_state, trash_cmd=None
     return local, refetch
 
 
-def prioritize_to_fetch(to_fetch, playlist_key=None):
-    if not playlist_key:
-        return list(to_fetch)
-    first = [row for row in to_fetch if row.get('playlistKey') == playlist_key]
-    rest = [row for row in to_fetch if row.get('playlistKey') != playlist_key]
-    return first + rest
+def prioritize_to_fetch(to_fetch, playlist_first=None):
+    order = playlist_fetch_order(to_fetch, playlist_first)
+    rank = {key: i for i, key in enumerate(order)}
+    indexed = list(enumerate(to_fetch))
+    indexed.sort(key=lambda pair: (rank.get(pair[1].get('playlistKey'), len(order)), pair[0]))
+    return [row for _, row in indexed]
 
 
 def catalogue_index(catalogue):
@@ -953,19 +973,42 @@ def plan_evictions(hot_dir, hot_map, wanted_rels, played, fetched, remote_rels, 
     evict = []
     if target <= 0:
         return evict
+    seen = set()
     for row in evictable_files(hot_map, wanted_rels, played, fetched, remote_rels, keep_days, now):
         evict.append(row)
+        seen.add(row['relativePath'])
         target -= row['sizeBytes']
         if target <= 0:
-            break
+            return evict
+    # Under cap pressure for explicitly wanted tracks, evict younger unwanted R2-backed files
+    # in LRU order rather than starving active stations/likes (e.g. when the whole hot set is
+    # younger than keep_days). Wanted files and anything missing from R2 remain protected.
+    if target > 0 and extra_fetch_bytes > 0 and keep_days > 0:
+        younger = []
+        for rel, row in hot_map.items():
+            if rel in wanted_rels or rel in seen or rel not in remote_rels:
+                continue
+            younger.append({
+                'relativePath': rel,
+                'sizeBytes': row['sizeBytes'],
+                'path': row['path'],
+                'lastActivity': activity_timestamp(rel, played, fetched, row, now),
+            })
+        younger.sort(key=lambda r: r['lastActivity'])
+        for row in younger:
+            evict.append(row)
+            target -= row['sizeBytes']
+            if target <= 0:
+                break
     return evict
 
 
 def compute_plan(requests_doc, catalogue, hot_dir, played, fetched, remote_rels, cap_bytes, keep_days,
-                 now=None, verified_state=None, trash_cmd=None, playlist_first=None, max_tracks=120):
+                 now=None, verified_state=None, trash_cmd=None, playlist_first=None, max_tracks=120,
+                 quarantine=()):
     now = now if now is not None else time.time()
     playlists, wanted_entries, unmatched, library_playlists = wanted_entries_from_requests(
-        requests_doc, catalogue, max_tracks=max_tracks)
+        requests_doc, catalogue, max_tracks=max_tracks, quarantine=quarantine)
     wanted_rels = {e['catalogue']['relativePath'] for e in wanted_entries}
     hot_map = hot_file_state(hot_dir)
     verified_state = verified_state if verified_state is not None else {}
@@ -1154,7 +1197,7 @@ def touch_played(path, state, config=None, now=None):
 def build_status(requests_doc, catalogue, cfg, state, last_status):
     limit = max_playlist_tracks(cfg)
     _, wanted_entries, _, library_from_requests = wanted_entries_from_requests(
-        requests_doc, catalogue, max_tracks=limit)
+        requests_doc, catalogue, max_tracks=limit, quarantine=cfg.get('quarantine_sha256', ()))
     wanted_rels = {e['catalogue']['relativePath'] for e in wanted_entries}
     hot_map = hot_file_state(cfg['hot_dir'])
     local_rels = set(hot_map) & wanted_rels
@@ -1170,7 +1213,7 @@ def build_status(requests_doc, catalogue, cfg, state, last_status):
             library_keys.add(row['key'])
     per_playlist = []
     any_missing = False
-    entries = index_catalogue(catalogue)
+    entries = index_catalogue(catalogue, cfg.get('quarantine_sha256', ()))
 
     def playlist_counts(tracks):
         wanted = len(tracks)
@@ -1353,7 +1396,8 @@ def main(argv=None):
             plan = compute_plan(requests_doc, catalogue, cfg['hot_dir'], load_played(state), load_fetched(state),
                                 remote_rels, cap_bytes, cfg['keep_days'], verified_state=verified,
                                 playlist_first=getattr(args, 'playlist_key', None),
-                                max_tracks=max_playlist_tracks(cfg))
+                                max_tracks=max_playlist_tracks(cfg),
+                                    quarantine=cfg.get('quarantine_sha256', ()))
             if cached_catalogue_note:
                 plan['catalogueSource'] = 'cache'
                 plan['metered'] = True
@@ -1388,7 +1432,8 @@ def main(argv=None):
                 plan = compute_plan(requests_doc, catalogue, cfg['hot_dir'], load_played(state), load_fetched(state),
                                     remote_rels, cap_bytes, cfg['keep_days'], verified_state=verified,
                                     playlist_first=getattr(args, 'playlist_key', None),
-                                    max_tracks=max_playlist_tracks(cfg))
+                                    max_tracks=max_playlist_tracks(cfg),
+                                    quarantine=cfg.get('quarantine_sha256', ()))
                 status = sync_execute(plan, cfg, state, remote_rels, allow_metered=allow_metered,
                                       playlist_first=getattr(args, 'playlist_key', None))
                 print(json.dumps({

@@ -1196,6 +1196,32 @@ class TvChannelCheckTests(MediaSyncTestBase):
         self.cfg["tv_channel_scores"] = str(self.channel_file())
         self.assertEqual(self.row()["status"], "warn")
 
+    def test_music_space_builds_kind_picks_and_affinity_boost(self):
+        mix_dir = self.root / "gb-mix"
+        mix_dir.mkdir(parents=True, exist_ok=True)
+        (mix_dir / "library.json").write_text(json.dumps({
+            "tracks": [
+                {"id": "T1", "artist": "Khruangbin", "title": "Time", "plays": 12, "fav": True},
+                {"id": "T2", "artist": "Bonobo", "title": "Kerala", "plays": 3, "fav": False},
+                {"id": "T3", "artist": "Bad Act", "title": "Nope", "plays": 1, "dislike": True},
+            ]
+        }), encoding="utf-8")
+        (mix_dir / "music-space.json").write_text(json.dumps({
+            "tracks": {
+                "T1": {"kind": "chill", "kindScore": 0.92, "next": [["T2", 0.91]]},
+                "T2": {"kind": "chill", "kindScore": 0.85, "next": [["T1", 0.91]]},
+                "T3": {"kind": "chill", "kindScore": 0.95, "next": []},
+            }
+        }), encoding="utf-8")
+        kind_picks, aff = ms.build_music_space_picks_and_affinity(mix_dir, {}, max_n=50)
+        self.assertEqual([r["title"] for r in kind_picks["chill"]], ["Time", "Kerala"])
+        boosted = ms.boost_station_picks_with_affinity(
+            [{"key": ms.track_key("Bonobo", "Kerala"), "artist": "Bonobo", "title": "Kerala", "score": 0.5, "why": "rot"}],
+            aff,
+        )
+        self.assertGreater(boosted[0]["score"], 0.5)
+        self.assertIn("map taste", boosted[0]["why"])
+
 
 class GlancebarAppCheckTests(MediaSyncTestBase):
     def rows(self):
@@ -1267,3 +1293,53 @@ class RadioThinRowTest(unittest.TestCase):
             row = ms.radio_library_row({"radio_library_remote": "x"}, {}, "m5")
         self.assertIn("thin: RTRFM 16/8, 60s 12/9", row["value"])
         self.assertIn("cap raised to $50 today", row["value"])
+
+
+class MusicSpaceVectorExpansionTests(unittest.TestCase):
+    def test_vector_centroids_and_artist_priors_expand_tv_kind_scores(self):
+        from array import array
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mix = root / "mix"
+            vec_dir = root / "vectors"
+            vids = root / "videos"
+            mix.mkdir()
+            vec_dir.mkdir()
+            (vids / "Khruangbin").mkdir(parents=True)
+            (vids / "ODESZA").mkdir(parents=True)
+            (vids / "Khruangbin" / "Khruangbin - Texas Sun [vid1].mp4").write_bytes(b"v")
+            (vids / "Khruangbin" / "Khruangbin - Pelota [vid2].mp4").write_bytes(b"v")
+            (vids / "ODESZA" / "ODESZA - Late Night [vid3].mp4").write_bytes(b"v")
+
+            (mix / "library.json").write_text(
+                json.dumps({"tracks": [{"id": "T1", "artist": "Khruangbin", "title": "Time (You and I)", "fav": True, "plays": 10}]}),
+                encoding="utf-8",
+            )
+            (mix / "music-space.json").write_text(
+                json.dumps({"tracks": {"T1": {"kind": "chill", "kindScore": 0.9, "next": []}}}),
+                encoding="utf-8",
+            )
+            index_rows = [
+                {"id": "h1", "artist": "Khruangbin", "title": "Time (You and I)"},
+                {"id": "h2", "artist": "ODESZA", "title": "Late Night"},
+            ]
+            (vec_dir / "tracks-index.jsonl").write_text(
+                "\n".join(json.dumps(r) for r in index_rows) + "\n", encoding="utf-8"
+            )
+            floats = array("f", [1.0, 0.0, 0.0, 0.0, 0.96, 0.28, 0.0, 0.0])
+            with (vec_dir / "tracks.f32").open("wb") as fh:
+                floats.tofile(fh)
+
+            kind_picks, aff = ms.build_music_space_picks_and_affinity(mix, {}, max_n=50, vectors_dir=vec_dir)
+            chill_titles = {(p["artist"], p["title"]) for p in kind_picks.get("chill", [])}
+            self.assertIn(("ODESZA", "Late Night"), chill_titles)
+            self.assertIn(("Khruangbin", "*"), chill_titles)
+            self.assertGreater(len(aff), 1)
+
+            cfg = dict(ms.DEFAULTS, tv_music_videos=str(vids), tv_src_prefix="music")
+            doc, matched_n, _ = ms.build_tv_channel_scores(cfg, kind_picks)
+            chill_items = doc["channels"]["chill"]["items"]
+            self.assertEqual(matched_n["chill"], 3)
+            self.assertIn("music/ODESZA/ODESZA - Late Night [vid3].mp4", chill_items)
+            self.assertIn("music/Khruangbin/Khruangbin - Texas Sun [vid1].mp4", chill_items)
+            self.assertIn("(artist)", chill_items["music/Khruangbin/Khruangbin - Texas Sun [vid1].mp4"]["why"])

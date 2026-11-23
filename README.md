@@ -1,6 +1,6 @@
 # music-core
 
-The shared backend behind a personal multi-surface music system: a phone-first web radio ([6IAN](https://github.com/todd866/6ian-radio)), a macOS menu-bar lossless player ([Glancebar](https://github.com/todd866/glancebar)), and a living-room TV music-video player ([Onto the TV](https://github.com/todd866/onto-the-tv)).
+The shared backend behind a personal multi-surface music system: a phone-first web radio ([6IAN](https://github.com/todd866/6ian-radio)), a native iOS/macOS/tvOS station player ([Onto the Radio](https://github.com/todd866/onto-the-radio)), a macOS menu-bar lossless player ([Glancebar](https://github.com/todd866/glancebar)), a living-room TV player ([Onto the TV](https://github.com/todd866/onto-the-tv)), and the shared coordinate/lens commons ([Manifold](https://github.com/todd866/manifold)).
 
 ```mermaid
 flowchart LR

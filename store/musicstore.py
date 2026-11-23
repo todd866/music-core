@@ -170,15 +170,27 @@ def build_ids(entries, claims=(), previous=None):
     isrc_map = {i: _canonical(s, entry_by_sha, (previous.get('isrc') or {}).get(i)) for i, s in by_isrc.items()}
     aliases = {'apple': {}, 'persistent': {}, 'youtube': {}}
     how = {'apple': {}, 'persistent': {}, 'youtube': {}}
+    supersedes = {}
+    for old_s, new_s in (previous.get('supersedes') or {}).items():
+        if new_s in entry_by_sha and old_s != new_s:
+            supersedes[old_s] = new_s
     unresolved = {k: 0 for k in aliases}
     for c in claims:
         kind = c.get('kind')
+        if kind == 'supersedes':
+            old_s = str(c.get('id') or '')
+            target = c.get('sha') if c.get('sha') in entry_by_sha else by_path.get(c.get('relativePath'))
+            if old_s and target and old_s != target:
+                supersedes[old_s] = target
+            continue
         if kind not in aliases:
             continue
         cid = str(c['id'])
         sha, via = None, None
         if c.get('sha') in entry_by_sha:
             sha, via = c['sha'], 'sha'
+        elif c.get('sha') in supersedes:
+            sha, via = supersedes[c['sha']], 'sha'
         elif c.get('relativePath') in by_path:
             sha, via = by_path[c['relativePath']], 'path'
         elif c.get('isrc') and str(c['isrc']).upper() in isrc_map:
@@ -195,18 +207,20 @@ def build_ids(entries, claims=(), previous=None):
             continue
         aliases[kind][cid] = sha
         how[kind][cid] = via
-    # Carry forward an alias whose song is still catalogued but whose claim was not offered this
-    # run (a drive that could not be read tonight must not drop the TV's YouTube ids).
+    # Carry forward an alias whose song is still catalogued (or superseded by a repaired master)
+    # when its claim was not offered this run.
     for kind in aliases:
         for cid, sha in (previous.get(kind) or {}).items():
-            if cid not in aliases[kind] and sha in entry_by_sha:
-                aliases[kind][cid] = sha
+            target = supersedes.get(sha, sha)
+            if cid not in aliases[kind] and target in entry_by_sha:
+                aliases[kind][cid] = target
                 how[kind][cid] = (previous.get('how') or {}).get(kind, {}).get(cid, 'carried')
     counts = {'songs': len(entry_by_sha), 'key': len(key_map), 'collisions': len(collisions),
-              'isrc': len(isrc_map), 'path': len(by_path),
+              'isrc': len(isrc_map), 'path': len(by_path), 'supersedes': len(supersedes),
               **{k: len(v) for k, v in aliases.items()}, 'unresolved': unresolved}
     return {'schemaVersion': 1, 'generatedAt': int(time.time()), 'key': key_map, 'isrc': isrc_map,
-            'path': by_path, **aliases, 'how': how, 'collisions': collisions, 'counts': counts}
+            'path': by_path, 'supersedes': supersedes, **aliases, 'how': how,
+            'collisions': collisions, 'counts': counts}
 
 
 class Ids:
@@ -222,9 +236,13 @@ class Ids:
     def __bool__(self):
         return bool(self.doc.get('key'))
 
-    def resolve(self, *, apple=None, persistent=None, youtube=None, isrc=None, path=None,
+    def resolve(self, *, sha=None, apple=None, persistent=None, youtube=None, isrc=None, path=None,
                 artist=None, title=None):
         d = self.doc
+        if sha:
+            sup = (d.get('supersedes') or {}).get(str(sha))
+            if sup:
+                return sup, 'supersedes'
         for kind, value in (('persistent', persistent), ('apple', apple), ('youtube', youtube),
                             ('path', path)):
             if value and str(value) in (d.get(kind) or {}):
@@ -423,14 +441,17 @@ def _epoch_ms(at):
     return int(dt.timestamp() * 1000)
 
 
-def build_snapshot(listener, events, *, tz='Australia/Perth', style='home', newShare=None, now=None):
+def build_snapshot(listener, events, *, tz='Australia/Perth', style='home', newShare=None, now=None,
+                   supersedes=None):
     """Fold a listener's taste events (oldest first, any app/host) into the engine's snapshot:
     exactly the Profile fields buildQueue reads. like/unlike and dislike/undislike toggle;
     skip and early-skip each count once; the latest play/finish per sha sets heard (epoch ms).
-    Alias-only events cannot key a song and are ignored."""
+    Superseded shas (e.g. a truncated fragment replaced by its full master) map onto the new sha."""
+    sup = supersedes or {}
     likes, dislikes, skips, heard = [], [], {}, {}
     for ev in sorted(events, key=lambda e: e.get('at') or ''):
-        sha, kind = ev.get('sha'), ev.get('kind')
+        raw_sha, kind = ev.get('sha'), ev.get('kind')
+        sha = sup.get(raw_sha, raw_sha) if raw_sha else None
         if not sha or ev.get('listener') != listener:
             continue
         ts = _epoch_ms(ev.get('at'))
@@ -476,6 +497,8 @@ def write_snapshot(listener, state=None, cfg=None, runner=None, **kw):
             kw.setdefault('tz', prev['tz'])
         if prev.get('newShare') is not None:
             kw.setdefault('newShare', prev['newShare'])
+    if 'supersedes' not in kw:
+        kw['supersedes'] = Ids.load(state / 'ids.json').doc.get('supersedes') or {}
     snap = build_snapshot(listener, read_events(root, listener), **kw)
     path = state / 'taste-all' / listener / 'snapshot.json'
     path.parent.mkdir(parents=True, exist_ok=True)

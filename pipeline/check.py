@@ -160,6 +160,53 @@ def collect_m2_rows() -> list[dict]:
             rows.append(_row("mc:worker:pool", st, "2TB cloud pool", f"{free:.0f}/{quota:.0f} GB free",
                              f"{u.get('count', 0)} files", f"{pc.get('cloud_remote')}: {free:.1f} GB free (Hi-Res {'on' if free >= float(pc.get('hires_free_gb', 300)) else 'off'})"))
 
+    # 6. Truncated master check (< 25s tracks in embed tracks.jsonl not yet quarantined/replaced)
+    tracks_p = HOME / ".local/state/music-embed/tracks.jsonl"
+    if tracks_p.is_file():
+        lib_cfg = _load_json(HOME / ".config/glancebar/music-library.json") or {}
+        quar = set(lib_cfg.get("quarantine_sha256") or [])
+        short_unquar = 0
+        short_total = 0
+        try:
+            for ln in tracks_p.read_text(encoding="utf-8").splitlines():
+                if not ln.strip():
+                    continue
+                rec = json.loads(ln)
+                dur = float(rec.get("durationSeconds") or 0.0)
+                if 0 < dur < 25.0:
+                    short_total += 1
+                    if rec.get("id") not in quar:
+                        short_unquar += 1
+        except Exception:
+            pass
+        if short_unquar > 0:
+            rows.append(_row("mc:worker:durations", "warn", "master lengths", f"{short_unquar} truncated",
+                             f"{short_total} <25s", f"{short_unquar} master(s) < 25s not quarantined/repaired"))
+        else:
+            rows.append(_row("mc:worker:durations", "pass", "master lengths", "ok",
+                             f"{short_total} quarantined" if short_total else "all >=25s"))
+
+    # 7. Holistic $100/month Gemini API credit utilization & ceiling
+    try:
+        embed_dir = Path(__file__).resolve().parent.parent / "embed"
+        if str(embed_dir) not in sys.path:
+            sys.path.insert(0, str(embed_dir))
+        import budget as gemini_budget
+        bsnap = gemini_budget.compute_snapshot()
+        mtd = float(bsnap["mtdUsd"]["total"])
+        ceil = float(bsnap["automatedCeilingUsd"])
+        credit = float(bsnap["monthlyCreditUsd"])
+        rem = float(bsnap["remainingPoolUsd"])
+        ym = bsnap["billingMonthPacific"]
+        bst = "fail" if mtd > credit else ("warn" if mtd > ceil + 0.50 else "pass")
+        rows.append(_row(
+            "mc:worker:budget", bst, "gemini credit",
+            f"${mtd:.2f}/${ceil:.0f}", f"${rem:.2f} left",
+            f"{ym} MTD ${mtd:.2f} of ${ceil:.2f} automated pool (${credit:.0f} AI Ultra credit)",
+        ))
+    except Exception:
+        pass
+
     return rows
 
 

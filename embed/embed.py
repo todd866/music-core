@@ -1135,7 +1135,31 @@ def cmd_export(args: argparse.Namespace) -> int:
     payload = build_music_space(vectors, index, library)
     write_json(out_path, payload)
     print(json.dumps(payload["stats"], indent=2))
+    # Sibling export. The Gemini file above is unchanged. Gemma-only songs are filled
+    # from vectors-gemma/ through vectors/relation/calibration.json when those maps exist.
+    import relation
+    merged_path = relation.merged_export_path(out_path)
+    gemma_index, gemma_vectors, gemma_err = relation.load_gemma_map(vectors_dir)
+    try:
+        merged = relation.build_merged_space(
+            library, payload, gemma_index, gemma_vectors, relation.load_calibration(vectors_dir / "relation"),
+        )
+    except ValueError as exc:
+        print(f"merged: skipped ({exc})", file=sys.stderr)
+        return 0
+    if gemma_err:
+        merged["stats"]["gemmaWarning"] = gemma_err
+        print(f"merged: gemma map unreadable ({gemma_err})", file=sys.stderr)
+    write_json(merged_path, merged)
+    print(f"merged: {merged_path} {json.dumps(merged['stats'].get('bySource', {}))}")
     return 0
+
+
+def cmd_inc_relate(args: argparse.Namespace) -> int:
+    """Fit vectors/relation/ from the Gemini and Gemma maps. Does not write into the Gemini store."""
+    import relation
+    minutes = float(args.max_minutes)
+    return relation.relate(Path(args.state), max_minutes=None if minutes <= 0 else minutes)
 
 
 def cmd_neighbours(args: argparse.Namespace) -> int:
@@ -1243,6 +1267,19 @@ def reserve_spend(paths: Paths, usd: float, cap: float, *, note: str = "", now: 
         doc["days"][day] = total
         log = doc.get("log") if isinstance(doc.get("log"), list) else []
         log.append({"at": utc_now_iso(), "day": day, "usd": round(usd, 6), "note": note})
+        doc["log"] = log[-500:]
+        write_json(paths.spend, doc)
+        return total
+
+
+def release_spend(paths: Paths, usd: float, *, day: str, note: str = "") -> float:
+    """Take back a reservation for a batch that was never created (so never billed)."""
+    with spend_locked(paths):
+        doc = read_spend(paths.spend)
+        total = round(max(spend_today(doc, day) - usd, 0.0), 6)
+        doc["days"][day] = total
+        log = doc.get("log") if isinstance(doc.get("log"), list) else []
+        log.append({"at": utc_now_iso(), "day": day, "usd": -round(usd, 6), "note": note or "release"})
         doc["log"] = log[-500:]
         write_json(paths.spend, doc)
         return total
@@ -1589,6 +1626,8 @@ def cmd_inc_prepare(args: argparse.Namespace) -> int:
 def cmd_inc_submit(args: argparse.Namespace) -> int:
     """One Batch API job for the prepared songs, reserved against the daily cap first."""
     paths = Paths(Path(args.state))
+    mb = getattr(args, "max_bytes", None)
+    max_bytes = mb if isinstance(mb, int) and mb > 0 else SHARD_MAX_BYTES
     prepared = _prepared(paths)
     if not prepared:
         print("submit: nothing prepared")
@@ -1615,7 +1654,6 @@ def cmd_inc_submit(args: argparse.Namespace) -> int:
         print(f"submit: daily cap reached (${args.cap_usd - remaining:.2f} of ${args.cap_usd:.2f} today); "
               f"{len(prepared)} songs wait for tomorrow")
         return 0
-    rows: list[tuple[str, Path]] = []
     for p in take:
         for key in p["clips"]:
             sha, idx = parse_clip_key(key)
@@ -1623,16 +1661,37 @@ def cmd_inc_submit(args: argparse.Namespace) -> int:
             if not (clip.is_file() and clip.stat().st_size > 0):
                 print(f"submit: clip missing {clip}; run prepare again", file=sys.stderr)
                 return 1
-            rows.append((key, clip))
-    usd = round(sum(float(p["estUsd"]) for p in take), 6)
     shard = "inc-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     paths.inc_batches.mkdir(parents=True, exist_ok=True)
     shard_path = paths.inc_batches / f"{shard}.jsonl"
     part = shard_path.with_suffix(".jsonl.part")
+    # The Files API refuses uploads over 2 GiB (21 Nov 2026: one 763-song shard failed with 413),
+    # so a shard takes whole songs only while it stays under max_bytes; the rest wait for the
+    # next run.
+    rows: list[tuple[str, Path]] = []
+    kept: list[dict[str, Any]] = []
+    size = 0
     with open(part, "wb") as fh:
-        for key, clip in rows:
-            fh.write(encode_batch_line(key, clip))
+        for p in take:
+            lines = []
+            for key in p["clips"]:
+                sha, idx = parse_clip_key(key)
+                clip = paths.clips / sha / f"{idx}.mp3"
+                lines.append((key, clip, encode_batch_line(key, clip)))
+            song_bytes = sum(len(b) for _, _, b in lines)
+            if kept and size + song_bytes > max_bytes:
+                break
+            for key, clip, b in lines:
+                fh.write(b)
+                rows.append((key, clip))
+            size += song_bytes
+            kept.append(p)
     part.replace(shard_path)
+    if len(kept) < len(take):
+        print(f"submit: shard holds {len(kept)} of {len(take)} songs ({size / 2**30:.2f} GiB, "
+              f"limit {max_bytes / 2**30:.2f}); the rest go in the next shard")
+    take = kept
+    usd = round(sum(float(p["estUsd"]) for p in take), 6)
     if args.dry_run:
         print(f"submit (dry run): {shard} {len(take)} songs, {len(rows)} clips, ${usd:.2f}")
         return 0
@@ -1654,17 +1713,31 @@ def cmd_inc_submit(args: argparse.Namespace) -> int:
     }
     jobs.append(rec)
     save_jobs(paths.inc_jobs, jobs)
+    job_created = False
     try:
         client = get_genai_client()
         upload = client.files.upload(file=str(shard_path), config={"mime_type": "jsonl"})
         job = client.batches.create_embeddings(
             model=args.model, src={"file_name": upload.name}, config={"display_name": shard},
         )
+        job_created = True
         rec.update(file_name=upload.name, job_name=job.name, state="SUBMITTED")
-    except Exception as exc:  # the reservation stands: a failed upload is not refunded
+    except Exception as exc:
         rec.update(state="SUBMIT_FAILED", error=str(exc)[:300])
         save_jobs(paths.inc_jobs, jobs)
         print(f"submit: {shard} failed: {str(exc)[:300]}", file=sys.stderr)
+        if not job_created:
+            # No batch job exists, so nothing can be billed: give the reservation back.
+            try:
+                total = release_spend(paths, usd, day=ledger_day(), note=f"{shard} not created")
+                print(f"submit: released ${usd:.2f}; today ${total:.2f}")
+            except SpendError as rel_exc:
+                print(f"submit: could not release reservation: {rel_exc}", file=sys.stderr)
+        if not job_created and "monthly spending cap" in str(exc).lower():
+            # The owner's AI Studio monthly cap, not a fault (the owner, 21 Nov 2026: "don't raise the cap").
+            # Gemini waits for the month to roll over; the local Gemma map carries on meanwhile.
+            print("submit: paused: AI Studio monthly spending cap reached; songs stay prepared")
+            return 0
         return 1
     save_jobs(paths.inc_jobs, jobs)
     taken = set(rec["ids"])
@@ -1885,6 +1958,12 @@ def build_parser() -> argparse.ArgumentParser:
     iwait.add_argument("--timeout", type=float, default=7200)
     iwait.add_argument("--interval", type=float, default=60)
     iwait.set_defaults(func=cmd_inc_wait)
+    irel = inc_sub.add_parser(
+        "relate",
+        help="fit vectors/relation/ (ridge, calibration, agreement) between the Gemma and Gemini maps",
+    )
+    irel.add_argument("--max-minutes", type=float, default=10, help="time budget; 0 means no limit")
+    irel.set_defaults(func=cmd_inc_relate)
 
     sp = sub.add_parser("spend", help="today's embedding spend against the cap")
     sp.add_argument("--init", action="store_true", help="create the ledger if it is missing")

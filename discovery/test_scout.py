@@ -983,6 +983,69 @@ class ScoutLogicTests(unittest.TestCase):
         self.assertNotIn("Song", titles)
         self.assertNotIn("Drop", titles)
 
+    def test_publish_promise_retention_and_lane_catalogue_binding(self):
+        hearts_path = self.root / "hearts.json"
+        hearts_path.write_text(json.dumps({"tracks": []}), encoding="utf-8")
+        play_log = self.root / "playback.jsonl"
+        ml_state = self.root / "ml-state"
+        ml_state.mkdir(parents=True, exist_ok=True)
+        (ml_state / "catalogue.json").write_text(
+            json.dumps({
+                "schemaVersion": 1,
+                "entries": [{
+                    "relativePath": "AM-Lossless/Pale Jay/Rodeo.m4a",
+                    "sizeBytes": 12345,
+                    "sha256": "a" * 64,
+                    "tags": {"artist": "Pale Jay", "title": "Rodeo", "album": "Bewilderment"},
+                    "durationSeconds": 212.0,
+                }],
+            }),
+            encoding="utf-8",
+        )
+        old_30d = "2026-10-11T12:00:00Z"
+        # 1) Unheard Shazam 30 days old (> fresh_days=14) stays because it is high-promise and unheard:
+        scout.append_jsonl(self.paths.ledger, {
+            "at": old_30d, "action": "acquired", "artist": "Unheard Shazam", "title": "Keep Me",
+            "source": "shazam", "why": "Shazamed 11 Oct", "track_key": scout.track_key("Unheard Shazam", "Keep Me"),
+            "duration_seconds": 180.0,
+        })
+        # 2) Heard Shazam 30 days old ages out once playback.jsonl shows durable listening:
+        scout.append_jsonl(self.paths.ledger, {
+            "at": old_30d, "action": "acquired", "artist": "Heard Shazam", "title": "Age Out",
+            "source": "shazam", "why": "Shazamed 11 Oct", "track_key": scout.track_key("Heard Shazam", "Age Out"),
+            "duration_seconds": 180.0,
+        })
+        play_log.write_text(
+            json.dumps({"event": "track", "artist": "Heard Shazam", "title": "Age Out", "epoch": 1000.0, "cause": "click"}) + "\n"
+            + json.dumps({"event": "track", "artist": "Next", "title": "Other", "epoch": 1180.0, "cause": "auto-advance"}) + "\n",
+            encoding="utf-8",
+        )
+        # 3) Lane-handed discovery binds once present in catalogue.json; back-catalogue lane row is omitted:
+        scout.append_jsonl(self.paths.ledger, {
+            "at": "2026-11-09T12:00:00Z", "action": "lane", "artist": "Pale Jay", "title": "Rodeo",
+            "source": "radio:kcrw", "why": "Heard on BBC 6 Music and KCRW", "era": "new",
+            "track_key": scout.track_key("Pale Jay", "Rodeo"),
+        })
+        scout.append_jsonl(self.paths.ledger, {
+            "at": "2026-11-09T12:00:00Z", "action": "lane", "artist": "AC/DC", "title": "Back Classic",
+            "source": "back:canon", "why": "1980 canon", "era": "back",
+            "track_key": scout.track_key("AC/DC", "Back Classic"),
+        })
+        cfg = dict(
+            self.cfg,
+            fresh_days=14,
+            hearts_path=str(hearts_path),
+            playback_log=str(play_log),
+            music_library_state=str(ml_state),
+        )
+        doc = scout.cmd_publish(cfg, self.paths, scout.Runners(clock=lambda: "2026-11-10T12:00:00Z"))
+        by_title = {t["title"]: t for t in doc["tracks"]}
+        self.assertIn("Keep Me", by_title)
+        self.assertNotIn("Age Out", by_title)
+        self.assertIn("Rodeo", by_title)
+        self.assertEqual(by_title["Rodeo"]["sha256"], "a" * 64)
+        self.assertNotIn("Back Classic", by_title)
+
     def test_dry_run_does_not_acquire(self):
         self.paths.queue.write_text(
             json.dumps(
@@ -1263,6 +1326,71 @@ class LockTests(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 75)
             finally:
                 os.close(fd)
+
+
+class AiPickFallbackTests(unittest.TestCase):
+    def test_skips_paused_and_falls_back_on_engine_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paused_file = root / "paused-providers"
+            paused_file.write_text("claude\ncodex\n", encoding="utf-8")
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+
+            # Fake ai-pick: returns first engine passed in --engines
+            ai_pick = bin_dir / "ai-pick"
+            ai_pick.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                "idx = sys.argv.index('--engines') + 1\n"
+                "print(sys.argv[idx].split(',')[0])\n",
+                encoding="utf-8",
+            )
+            ai_pick.chmod(0o755)
+
+            # Fake glm-opinion fails (simulating transient error); agy-opinion succeeds
+            glm = bin_dir / "glm-opinion"
+            glm.write_text("#!/bin/sh\necho 'rate limit' >&2\nexit 1\n", encoding="utf-8")
+            glm.chmod(0o755)
+
+            agy = bin_dir / "agy-opinion"
+            agy.write_text("#!/bin/sh\necho '{\"picks\":[]}'\n", encoding="utf-8")
+            agy.chmod(0o755)
+
+            old_paused = scout.PAUSED_PROVIDERS_PATH
+            old_path = os.environ.get("PATH", "")
+            try:
+                scout.PAUSED_PROVIDERS_PATH = paused_file
+                os.environ["PATH"] = f"{bin_dir}:{old_path}"
+                rc, out = scout._default_ai_pick("test prompt", str(ai_pick))
+            finally:
+                scout.PAUSED_PROVIDERS_PATH = old_paused
+                os.environ["PATH"] = old_path
+
+            self.assertEqual(rc, 0)
+            self.assertIn('{"picks":[]}', out)
+
+
+class PlaybackArtistReceptionTests(unittest.TestCase):
+    def test_playback_reception_boosts_completed_and_penalizes_early_skipped_artists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "playback.jsonl"
+            events = [
+                {"event": "track", "artist": "Loved Band", "title": "A", "epoch": 1000, "cause": "select"},
+                {"event": "track", "artist": "Loved Band", "title": "B", "epoch": 1220, "cause": "auto-advance"},
+                {"event": "track", "artist": "Loved Band", "title": "C", "epoch": 1440, "cause": "crossfade"},
+                {"event": "track", "artist": "Skipped Act", "title": "X", "epoch": 1650, "cause": "auto-advance"},
+                {"event": "track", "artist": "Skipped Act", "title": "Y", "epoch": 1660, "cause": "click-next"},
+                {"event": "track", "artist": "Other", "title": "Z", "epoch": 1672, "cause": "click-next"},
+            ]
+            log.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+            rec = scout.playback_artist_reception({"playback_log": str(log)})
+            self.assertGreater(rec.get("loved band", 0.0), 0.10)
+            self.assertLess(rec.get("skipped act", 0.0), -0.10)
+
+            s_loved = scout.score_candidate({"artist": "Loved Band", "title": "New", "score_hint": 0.5}, {}, scout.Counter(), artist_reception=rec)
+            s_skip = scout.score_candidate({"artist": "Skipped Act", "title": "New", "score_hint": 0.5}, {}, scout.Counter(), artist_reception=rec)
+            self.assertGreater(s_loved, 0.60)
+            self.assertLess(s_skip, 0.40)
 
 
 if __name__ == "__main__":

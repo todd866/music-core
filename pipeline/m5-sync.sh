@@ -56,6 +56,13 @@ if rsync -t -e "ssh ${ssh_opts[*]}" \
     "$peer:.local/state/music-embed/nightly-status.json" \
     "$emb/" >> "$log" 2>&1 || true
   say "vectors: pulled from $peer"
+  # Coverage map + relation (the owner, 21 Nov 2026: two maps in parallel and a map of how they relate), for the
+  # merged neighbour export Glancebar reads. Their change also triggers a re-export.
+  coverage_before=$(cat "$emb/vectors-gemma/tracks-index.jsonl" "$emb/vectors/relation/relation.json" 2>/dev/null | cksum)
+  mkdir -p "$emb/vectors-gemma" "$emb/vectors/relation"
+  rsync -rt -e "ssh ${ssh_opts[*]}" "$peer:.local/state/music-embed/vectors-gemma/" "$emb/vectors-gemma/" >> "$log" 2>&1 || true
+  rsync -rt -e "ssh ${ssh_opts[*]}" "$peer:.local/state/music-embed/vectors/relation/" "$emb/vectors/relation/" >> "$log" 2>&1 || true
+  coverage_after=$(cat "$emb/vectors-gemma/tracks-index.jsonl" "$emb/vectors/relation/relation.json" 2>/dev/null | cksum)
 elif [ ! -e "$HOME/.local/state/METERED_LINK" ]; then
   remote=$(/opt/homebrew/bin/python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.config/glancebar/music-library.json")))["remote"].rstrip("/"))' 2>/dev/null || echo "")
   if [ -n "$remote" ] \
@@ -78,8 +85,19 @@ if (( got_vec )); then
       && mv -f "$emb/vectors/tracks-index.jsonl.part" "$emb/vectors/tracks-index.jsonl"
     after=$(cksum < "$emb/vectors/tracks-index.jsonl" 2>/dev/null || echo none)
     library="$HOME/Library/Application Support/Glancebar/mix/library.json"
-    if [ "$before" != "$after" ] && [ -f "$library" ]; then
-      HEAVY_SLOT_LOCAL=1 heavy-slot -- /opt/homebrew/bin/python3 "$root/embed/embed.py" export --vectors "$emb/vectors" >> "$log" 2>&1 \
+    if { [ "$before" != "$after" ] || [ "${coverage_before:-}" != "${coverage_after:-}" ] || [ ! -f "$HOME/Library/Application Support/Glancebar/mix/music-space-merged.json" ]; } && [ -f "$library" ]; then
+      exp_py="/opt/homebrew/bin/python3"
+      for cand in \
+        "$HOME/.local/state/music-gemma/venv/bin/python" \
+        "$HOME/.local/state/music-radio/venv/bin/python" \
+        "$HOME/.local/state/onto-tv-video-embed/gemma-venv/bin/python" \
+        "$HOME/.local/state/music-embed/venv/bin/python"; do
+        if [ -x "$cand" ] && "$cand" -c "import numpy" >/dev/null 2>&1; then
+          exp_py="$cand"
+          break
+        fi
+      done
+      HEAVY_SLOT_LOCAL=1 heavy-slot -- "$exp_py" "$root/embed/embed.py" export --vectors "$emb/vectors" >> "$log" 2>&1 \
         && say "music-space.json rewritten" || { say "FAIL export"; problems=1; notes+=("embed export failed"); }
     fi
   else
@@ -92,8 +110,13 @@ fi
 if [ ! -e "$HOME/.local/state/METERED_LINK" ]; then
   /opt/homebrew/bin/python3 "$root/store/musicstore.py" pull >> "$log" 2>&1 || say "store pull: warn"
   /opt/homebrew/bin/python3 "$root/store/musicstore.py" taste-pull >> "$log" 2>&1 || say "taste-pull: warn"
-  /opt/homebrew/bin/python3 "$root/library/musiclib.py" sync >> "$log" 2>&1
+  # --refresh-catalogue: without it the sync planned against whatever catalogue was first cached
+  # (11 Nov, 1,435 songs, until 22 Nov 2026), so nothing acquired later could reach this Mac.
+  /opt/homebrew/bin/python3 "$root/library/musiclib.py" sync --refresh-catalogue >> "$log" 2>&1
   rc=$?
+  # Re-publish new-music.json against the freshly pulled catalogue so M2 lane acquisitions
+  # appear in Glancebar's New music tile within hours rather than waiting for the nightly run.
+  /opt/homebrew/bin/python3 "$root/discovery/scout.py" publish >> "$log" 2>&1 || say "scout publish: warn"
   if (( rc == 0 )); then
     say "hot-set: synced"
   elif (( rc == 75 )); then
