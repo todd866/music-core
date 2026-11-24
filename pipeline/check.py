@@ -122,21 +122,22 @@ def collect_m2_rows() -> list[dict]:
         else:
             rows.append(_row("mc:worker:store", "pass", "m2 store-sync", "ok", f"{age*60:.0f}m"))
 
-    # 3. 6IAN fetch worker
-    r = subprocess.run(["pgrep", "-f", "media/fetch_worker.py"], capture_output=True)
-    lane_p = HOME / ".local/state/music-radio-fetch/lane.json"
-    lane_n = 0
-    if lane_p.is_file():
-        try:
-            ld = json.loads(lane_p.read_text())
-            lane_n = len(ld) if isinstance(ld, list) else len(ld.get("items", []))
-        except Exception:
-            pass
-    if r.returncode == 0:
-        rows.append(_row("mc:worker:fetch", "pass", "6ian fetch-worker", "running", f"lane {lane_n}"))
-    else:
-        rows.append(_row("mc:worker:fetch", "fail", "6ian fetch-worker", "not running", f"lane {lane_n}",
-                         "com.example.music-radio-fetch process not found"))
+    # 3. 6IAN fetch worker (skip if LaunchAgent retired)
+    if (HOME / "Library/LaunchAgents/com.example.music-radio-fetch.plist").is_file():
+        r = subprocess.run(["pgrep", "-f", "media/fetch_worker.py"], capture_output=True)
+        lane_p = HOME / ".local/state/music-radio-fetch/lane.json"
+        lane_n = 0
+        if lane_p.is_file():
+            try:
+                ld = json.loads(lane_p.read_text())
+                lane_n = len(ld) if isinstance(ld, list) else len(ld.get("items", []))
+            except Exception:
+                pass
+        if r.returncode == 0:
+            rows.append(_row("mc:worker:fetch", "pass", "6ian fetch-worker", "running", f"lane {lane_n}"))
+        else:
+            rows.append(_row("mc:worker:fetch", "fail", "6ian fetch-worker", "not running", f"lane {lane_n}",
+                             "com.example.music-radio-fetch process not found"))
 
     # 4. Facts freshness
     facts_p = HOME / ".local/state/music-store/facts.json"
@@ -224,9 +225,17 @@ def collect_m5_rows() -> list[dict]:
         st = "pass" if age <= 24 else ("warn" if age <= 72 else "fail")
         rows.append(_row("mc:primary:hotset", st, "m5 hot-set", "ok" if st == "pass" else f"stale {age:.0f}h", f"{age:.0f}h"))
 
-    # 3. Radio sync (10 min cadence)
-    rs_p = HOME / ".local/state/glancebar-radio/status.json"
-    rows.append(_check_fresh_status("mc:primary:radio-sync", "radio-sync", rs_p, 2, 12))
+    # 3. Radio sync (legacy 6IAN) or OTR connector (current)
+    if (HOME / "Library/LaunchAgents/com.example.glancebar-radio-sync.plist").is_file():
+        rs_p = HOME / ".local/state/glancebar-radio/status.json"
+        rows.append(_check_fresh_status("mc:primary:radio-sync", "radio-sync", rs_p, 2, 12))
+    if (HOME / "Library/LaunchAgents/com.example.glancebar-otr-connector.plist").is_file():
+        r_otr = subprocess.run(["pgrep", "-f", "otr_connector.py"], capture_output=True)
+        if r_otr.returncode == 0:
+            rows.append(_row("mc:primary:otr", "pass", "otr-connector", "running"))
+        else:
+            rows.append(_row("mc:primary:otr", "fail", "otr-connector", "not running", "",
+                             "com.example.glancebar-otr-connector process not found"))
 
     # 4. Scout last run
     sc_p = HOME / ".local/state/music-scout/last-run.json"
@@ -243,9 +252,9 @@ def collect_m5_rows() -> list[dict]:
             rows.append(_row("mc:primary:scout", "warn", "scout", f"{len(errs)} err", f"{age:.0f}h",
                              "; ".join(str(e)[:120] for e in errs[:2])))
 
-    # 5. 6IAN nightly rebuild
+    # 5. 6IAN nightly rebuild (skip if LaunchAgent retired)
     rb_log = HOME / ".local/state/music-radio/rebuild.log"
-    if rb_log.is_file():
+    if (HOME / "Library/LaunchAgents/com.example.music-radio-rebuild.plist").is_file() and rb_log.is_file():
         age = _age_h(rb_log) or 0.0
         st = "pass" if age <= 36 else ("warn" if age <= 72 else "fail")
         rows.append(_row("mc:primary:rebuild", st, "6ian rebuild", "ok" if st == "pass" else f"stale {age:.0f}h", f"{age:.0f}h"))
