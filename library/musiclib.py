@@ -755,6 +755,19 @@ def merge_extra_requests(requests_doc, extra_path=None):
     return merged
 
 
+TILE_PLAYLIST_PREFIXES = ('station:', 'reserve:', 'kind:', 'radio:')
+STATION_MAX_TRACKS = 50
+
+
+def is_tile_playlist_key(key):
+    return str(key or '').startswith(TILE_PLAYLIST_PREFIXES)
+
+
+def tile_track_limit(key, max_tracks):
+    limit = int(max_tracks)
+    return min(limit, STATION_MAX_TRACKS) if str(key or '').startswith('station:') else limit
+
+
 def wanted_entries_from_requests(requests_doc, catalogue, max_tracks=120, quarantine=()):
     entries = index_catalogue(catalogue, quarantine)
     playlists = []
@@ -765,7 +778,9 @@ def wanted_entries_from_requests(requests_doc, catalogue, max_tracks=120, quaran
         key = playlist.get('key', '')
         title = playlist.get('title', key)
         track_rows = playlist.get('tracks') or []
-        if len(track_rows) > max_tracks:
+        if is_tile_playlist_key(key):
+            track_rows = track_rows[:tile_track_limit(key, max_tracks)]
+        elif len(track_rows) > max_tracks:
             library_playlists.append({
                 'key': key,
                 'title': title,
@@ -1209,7 +1224,7 @@ def build_status(requests_doc, catalogue, cfg, state, last_status):
     skipped_keys = {row.get('key') for row in skipped if isinstance(row, dict) and row.get('key')}
     library_keys = {row.get('key') for row in library_from_requests if isinstance(row, dict) and row.get('key')}
     for row in library:
-        if isinstance(row, dict) and row.get('key'):
+        if isinstance(row, dict) and row.get('key') and not is_tile_playlist_key(row['key']):
             library_keys.add(row['key'])
     per_playlist = []
     any_missing = False
@@ -1234,7 +1249,10 @@ def build_status(requests_doc, catalogue, cfg, state, last_status):
         key = playlist.get('key', '')
         title = playlist.get('title', key)
         tracks = playlist.get('tracks') or []
-        is_library = key in library_keys or len(tracks) > limit
+        tile = is_tile_playlist_key(key)
+        if tile:
+            tracks = tracks[:tile_track_limit(key, limit)]
+        is_library = key in library_keys or (not tile and len(tracks) > limit)
         wanted, local_count, missing, unmatched = playlist_counts(tracks)
         row = {
             'name': title,
@@ -1258,7 +1276,7 @@ def build_status(requests_doc, catalogue, cfg, state, last_status):
     failed = bool(last_err)
     library_rows = list(library_from_requests)
     for row in library:
-        if isinstance(row, dict) and row not in library_rows:
+        if isinstance(row, dict) and not is_tile_playlist_key(row.get('key')) and row not in library_rows:
             library_rows.append(row)
     return {
         'schemaVersion': STATUS_SCHEMA,

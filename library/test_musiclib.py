@@ -432,6 +432,36 @@ class MusicLibLogicTests(unittest.TestCase):
         self.assertEqual(plan['library'][0]['key'], 'big')
         self.assertEqual(len(plan['toFetch']), 1)
 
+    def test_oversized_tile_playlist_caps_instead_of_skipping_as_library(self):
+        station_tracks = [{'id': f's{i}', 'title': 'Song', 'artist': 'Artist', 'album': 'Album'} for i in range(144)]
+        reserve_tracks = [{'id': f'r{i}', 'title': 'Song', 'artist': 'Artist', 'album': 'Album'} for i in range(150)]
+        req = {
+            'schemaVersion': 1,
+            'playlists': [
+                {'key': 'station:triplej', 'title': 'New music for you', 'tracks': station_tracks},
+                {'key': 'reserve:test', 'title': 'Reserve Mix', 'tracks': reserve_tracks},
+            ],
+        }
+        playlists, _, _, library = m.wanted_entries_from_requests(req, self.catalogue, max_tracks=120)
+        self.assertEqual(library, [])
+        by_key = {row['key']: row for row in playlists}
+        self.assertEqual(len(by_key['station:triplej']['tracks']), m.STATION_MAX_TRACKS)
+        self.assertEqual(len(by_key['reserve:test']['tracks']), 120)
+        cfg = m.load_config(self.config)
+        st = m.build_status(
+            req,
+            self.catalogue,
+            cfg,
+            self.state,
+            {'library': [{'key': 'station:triplej', 'title': 'New music for you', 'wanted': 144, 'library': True}]},
+        )
+        self.assertEqual(st['library'], [])
+        status_by_key = {row['key']: row for row in st['playlists']}
+        self.assertFalse(status_by_key['station:triplej']['library'])
+        self.assertEqual(status_by_key['station:triplej']['wanted'], m.STATION_MAX_TRACKS)
+        self.assertFalse(status_by_key['reserve:test']['library'])
+        self.assertEqual(status_by_key['reserve:test']['wanted'], 120)
+
     def test_sync_skips_playlist_that_does_not_fit(self):
         other_rel = 'Band/LP/other.m4a'
         other_path = self.masters / other_rel
